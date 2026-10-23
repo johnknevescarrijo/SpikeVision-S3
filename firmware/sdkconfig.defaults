@@ -1,0 +1,15 @@
+# SpikeVision-S3: Configuração Padrão do ESP-IDF para ESP32-S3
+CONFIG_IDF_TARGET="esp32s3"
+
+# CPU Frequency: 240 MHz (Máximo Desempenho)
+CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ_240=y
+CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ=240
+
+# Otimização do Compilador para Desempenho (-O3 / -O2 com inlining agressivo)
+CONFIG_COMPILER_OPTIMIZATION_PERF=y
+
+# Tamanho da Stack da Main Task (16 KB)
+CONFIG_ESP_MAIN_TASK_STACK_SIZE=16384
+
+# Desabilita Watchdog em loops intensivos de inferência se necessário
+CONFIG_ESP_TASK_WDT_TIMEOUT_S=10

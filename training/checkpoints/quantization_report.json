@@ -1,0 +1,126 @@
+{
+  "model_architecture": "SpikeVisionCSNN",
+  "training_checkpoint": "training/checkpoints/best_spikevision_csnn.pth",
+  "epoch": 24,
+  "config": {
+    "in_channels": 3,
+    "num_classes": 2,
+    "beta": 0.9,
+    "slope": 25.0,
+    "num_steps": 8,
+    "encoding": "direct"
+  },
+  "quantization_format": {
+    "weights": "int8_t (symmetric per-layer)",
+    "biases": "int32_t (scaled by s_total)",
+    "thresholds": "int32_t (scaled by s_total)",
+    "input_scale": 127,
+    "fixed_point_beta": {
+      "beta_num": 58982,
+      "beta_shift": 16,
+      "effective_beta": 0.899993896484375
+    }
+  },
+  "layers": {
+    "layer1": {
+      "w_max": 1.566417932510376,
+      "scale_weight": 81.07670205005059,
+      "scale_input": 127.0,
+      "scale_total": 10296.741160356425,
+      "vth_quantized": 10297,
+      "weight_shape": [
+        16,
+        3,
+        3,
+        3
+      ],
+      "bias_shape": [
+        16
+      ]
+    },
+    "layer2": {
+      "w_max": 0.384703665971756,
+      "scale_weight": 330.12422608243105,
+      "scale_input": 1.0,
+      "scale_total": 330.12422608243105,
+      "vth_quantized": 330,
+      "weight_shape": [
+        32,
+        16,
+        3,
+        3
+      ],
+      "bias_shape": [
+        32
+      ]
+    },
+    "layer3": {
+      "w_max": 0.270126074552536,
+      "scale_weight": 470.1508368282313,
+      "scale_input": 1.0,
+      "scale_total": 470.1508368282313,
+      "vth_quantized": 470,
+      "weight_shape": [
+        32,
+        32,
+        3,
+        3
+      ],
+      "bias_shape": [
+        32
+      ]
+    },
+    "layer4": {
+      "w_max": 0.15289415419101715,
+      "scale_weight": 830.6399984484267,
+      "scale_input": 1.0,
+      "scale_total": 830.6399984484267,
+      "vth_quantized": 831,
+      "weight_shape": [
+        2,
+        512
+      ],
+      "bias_shape": [
+        2
+      ]
+    }
+  },
+  "metrics_float32": {
+    "accuracy": 0.775,
+    "precision": 0.7579737335834896,
+    "recall": 0.808,
+    "f1_score": 0.782187802516941,
+    "tp": 808,
+    "fp": 258,
+    "fn": 192,
+    "tn": 742,
+    "total_samples": 2000,
+    "mean_sparsity": 0.8003766193659179
+  },
+  "metrics_int8": {
+    "accuracy": 0.7725,
+    "precision": 0.7413640389725421,
+    "recall": 0.837,
+    "f1_score": 0.7862846406763739,
+    "tp": 837,
+    "fp": 292,
+    "fn": 163,
+    "tn": 708,
+    "total_samples": 2000,
+    "mean_sparsity": 0.8006567503819418
+  },
+  "agreement_rate": 0.9645,
+  "memory_analysis": {
+    "flash_weights_bytes": 15280,
+    "flash_bias_bytes": 328,
+    "total_flash_model_bytes": 15608,
+    "total_flash_model_kb": 15.2421875,
+    "sram_membrane_potentials_bytes": 26632,
+    "sram_spike_buffers_bytes": 6658,
+    "sram_layer1_preconv_buffer_bytes": 16384,
+    "total_peak_sram_bytes": 49674,
+    "total_peak_sram_kb": 48.509765625,
+    "esp32s3_sram_total_kb": 512.0,
+    "esp32s3_sram_utilization_percent": 9.474563598632812
+  }
+}

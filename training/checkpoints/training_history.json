@@ -1,0 +1,15 @@
+[
+  {
+    "epoch": 1,
+    "train_loss": 0.7550812661647797,
+    "train_acc": 0.5,
+    "train_firing_rate": 0.5799566780564733,
+    "test_loss": 0.7350472807884216,
+    "test_acc": 0.5,
+    "test_cat_f1": 0.0,
+    "test_cat_precision": 0.0,
+    "test_cat_recall": 0.0,
+    "test_sparsity": 0.6606185697656954,
+    "epoch_time_sec": 0.12463259696960449
+  }
+]

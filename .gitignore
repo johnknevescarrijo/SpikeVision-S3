@@ -1,0 +1,31 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# CPython and virtual environments
+.env
+.venv
+env/
+venv/
+ENV/
+
+# Data and large downloads
+training/data/
+*.tar.gz
+
+# IDE and OS
+.vscode/
+.idea/
+.DS_Store
+*.swp
+
+# Embedded builds (ESP-IDF / PlatformIO)
+build/
+firmware/build/
+firmware/build_host/
+firmware/sdkconfig
+firmware/sdkconfig.old
+firmware/dependencies.lock
+.pio/
+.pioenvs/
