@@ -1,199 +1,199 @@
 # SpikeVision-S3 ⚡🐱
 
-> **Edge AI Neuromórfico**: Implementação de Spiking Neural Networks (SNN) compactas para visão computacional embarcada no microcontrolador **ESP32-S3**.
+> **Neuromorphic Edge AI**: Lightweight Spiking Neural Networks (SNN) implementation for embedded computer vision on the **ESP32-S3** microcontroller.
 
 ---
 
-## 📌 Visão Geral
+## 📌 Overview
 
-O **SpikeVision-S3** é um projeto de pesquisa e desenvolvimento focado em demonstrar a viabilidade e a eficiência da **computação neuromórfica na borda (Edge AI)**. Utilizando redes neurais pulsadas (**Spiking Neural Networks - SNN**), o projeto busca executar tarefas de visão computacional em hardware de baixo custo e baixo consumo de energia, explorando o microcontrolador **ESP32-S3**.
+**SpikeVision-S3** is an R&D project focused on demonstrating the feasibility and efficiency of **neuromorphic computing at the edge (Edge AI)**. By leveraging **Spiking Neural Networks (SNNs)**, the project aims to execute computer vision tasks on low-cost, ultra-low-power hardware, harnessing the **ESP32-S3** microcontroller.
 
-Diferente das redes neurais convolucionais artificiais convencionais (ANNs), que realizam multiplicações em ponto flutuante densas e contínuas, as SNNs processam informações através de **pulsos elétricos discretos (spikes)** distribuídos ao longo do tempo. Esse paradigma permite uma computação orientada a eventos extremamente eficiente, viabilizando inferência de aprendizado profundo em sistemas embarcados restritos.
-
----
-
-## 🎯 Objetivo Inicial (MVP)
-
-O primeiro marco (MVP) do projeto consiste na **classificação binária de imagens**:
-* **Classe 1:** Gato (`cat`)
-* **Classe 0:** Não-Gato (`non-cat` — amostras balanceadas das outras classes)
-* **Dataset:** [CIFAR-10](https://www.cs.toronto.edu/~kriz/cifar.html) (resolução nativa 32x32 pixels)
-
-O objetivo central é construir um pipeline completo e reprodutível: desde o pré-processamento e treinamento da SNN em ambiente host (PyTorch/snnTorch) até a quantização e execução da dinâmica neuronal diretamente no firmware do ESP32-S3.
+Unlike traditional Artificial Convolutional Neural Networks (ANNs), which perform dense, continuous floating-point matrix multiplications, SNNs process information through **discrete electrical pulses (spikes)** over time. This event-driven computing paradigm delivers exceptional energy efficiency, enabling deep learning inference on severely resource-constrained embedded systems.
 
 ---
 
-## 🧠 Por que SNN no ESP32-S3?
+## 🎯 Initial Milestone (MVP)
 
-### 1. Eficiência Energética e Computação Esparsa (*Sparsity*)
-* **De MAC para SOP:** Em ANNs tradicionais, cada sinapse realiza operações pesadas de multiplicação e acumulação (*Multiply-Accumulate* - **MAC**). Em SNNs com pulsos binários ($s \in \{0, 1\}$), quando não há spike ($s = 0$), nenhuma operação é realizada; quando há spike ($s = 1$), a operação reduz-se a uma simples adição de pesos (*Synaptic Operation* - **SOP**).
-* **Consumo Dinâmico Reduzido:** A esparsidade temporal e espacial diminui o tráfego de dados na memória e a dissipação térmica, prolongando a vida útil de aplicações alimentadas por bateria.
+The initial milestone (MVP) of the project is **binary image classification**:
+* **Class 1:** Cat (`cat`)
+* **Class 0:** Non-Cat (`non-cat` — balanced samples from other classes)
+* **Dataset:** [CIFAR-10](https://www.cs.toronto.edu/~kriz/cifar.html) (native 32x32 pixel resolution)
 
-### 2. Aproveitamento dos Recursos do ESP32-S3
-* **Instruções Vetoriais SIMD:** O processador dual-core Xtensa LX7 de 32 bits a 240 MHz possui suporte a instruções vetoriais para operações aritméticas paralelas de 8 e 16 bits (compatível com bibliotecas como `ESP-DSP` e `ESP-NN`).
-* **Memória Sob Medida:** O modelo é arquitetado para caber na memória interna (SRAM de 512 KB) sem depender obrigatoriamente de PSRAM externa para os estados de membrana, minimizando latências de barramento.
+The core objective is to establish an end-to-end, fully reproducible pipeline: from preprocessing and SNN training on the host (PyTorch / snnTorch) to quantization and execution of membrane dynamics directly within the ESP32-S3 firmware.
 
 ---
 
-## 🔄 Arquitetura & Pipeline do Projeto
+## 🧠 Why SNN on the ESP32-S3?
+
+### 1. Energy Efficiency & Sparsity
+* **From MAC to SOP:** In conventional ANNs, every synapse performs computationally intensive Multiply-Accumulate (**MAC**) operations. In SNNs with binary pulses ($s \in \{0, 1\}$), when no spike occurs ($s = 0$), no operation is executed; when a spike fires ($s = 1$), the calculation reduces to a simple weight accumulation (**Synaptic Operation - SOP**).
+* **Reduced Dynamic Power Consumption:** Temporal and spatial sparsity minimizes memory bus traffic and heat dissipation, significantly extending battery life in edge devices.
+
+### 2. Leveraging ESP32-S3 Capabilities
+* **SIMD Vector Instructions:** The dual-core 32-bit Xtensa LX7 processor running at 240 MHz supports vector instructions for parallel 8-bit and 16-bit arithmetic operations (compatible with libraries such as `ESP-DSP` and `ESP-NN`).
+* **Tailored Memory Footprint:** The architecture is designed to fit entirely within internal memory (512 KB SRAM) without requiring external PSRAM for membrane states, eliminating external bus latency.
+
+---
+
+## 🔄 Architecture & Project Pipeline
 
 ```
 +--------------------------------------------------------------------------+
-| 1. PREPARAÇÃO DE DADOS (Host / Python)                                   |
-|    - Dataset CIFAR-10 (32x32)                                            |
-|    - Filtro Binário: 'cat' vs 'non-cat'                                  |
-|    - Rate / Temporal Encoding: pixels -> trens de spikes em T passos     |
+| 1. DATA PREPARATION (Host / Python)                                      |
+|    - CIFAR-10 Dataset (32x32)                                            |
+|    - Binary Filter: 'cat' vs 'non-cat'                                   |
+|    - Rate / Direct Encoding: pixels -> spike trains across T timesteps   |
 +------------------------------------+-------------------------------------+
                                      |
                                      v
 +--------------------------------------------------------------------------+
-| 2. TREINAMENTO SNN (PyTorch + snnTorch)                                  |
-|    - Arquitetura: CSNN Leve com neurônios LIF (Leaky Integrate-and-Fire) |
-|    - Otimização via Surrogate Gradient Descent (FastSigmoid / ATan)      |
-|    - Regularização de atividade de spikes (limitação de disparo)         |
+| 2. SNN TRAINING (PyTorch + snnTorch)                                     |
+|    - Architecture: Lightweight CSNN with LIF (Leaky Integrate-and-Fire)   |
+|    - Optimization via Surrogate Gradient Descent (FastSigmoid / ATan)    |
+|    - Spike activity regularization (firing rate penalization)            |
 +------------------------------------+-------------------------------------+
                                      |
                                      v
 +--------------------------------------------------------------------------+
-| 3. QUANTIZAÇÃO & EXPORTAÇÃO                                              |
-|    - Quantização de pesos sinápticos e limiares (Int8 / Fixed-Point)     |
-|    - Exportação de tensores em headers C/C++ (weights.h / params.h)      |
-|    - Validação de degradação de acurácia no host                         |
+| 3. QUANTIZATION & EXPORT                                                 |
+|    - Quantization of synaptic weights and thresholds (Int8 / Fixed-Point) |
+|    - Export tensors to C/C++ headers (weights.h / params.h)               |
+|    - Bit-accurate validation and accuracy degradation evaluation on host |
 +------------------------------------+-------------------------------------+
                                      |
                                      v
 +--------------------------------------------------------------------------+
-| 4. MOTOR DE INFERÊNCIA EMBARCADO (ESP32-S3 / C++)                        |
-|    - Engine C/C++ bare-metal para dinâmica de membrana LIF               |
-|    - Propagação de spikes camada a camada ao longo de T passos           |
-|    - Decisão final por contagem de spikes (Spike Count / Argmax)         |
+| 4. EMBEDDED INFERENCE ENGINE (ESP32-S3 / C++)                            |
+|    - Bare-metal C/C++ engine for LIF membrane dynamics                   |
+|    - Layer-by-layer spike propagation over T timesteps                   |
+|    - Final decision via Spike Count / Argmax                             |
 +--------------------------------------------------------------------------+
 ```
 
-### Detalhes das Fases:
+### Pipeline Breakdown:
 
-1. **Codificação Temporal (Spike Encoding):** Os canais de entrada da imagem são normalizados e convertidos em trens de spikes binários ao longo de uma janela de tempo discreta $T$ (ex.: $T = 8$ a $16$ timesteps) via *Poisson Rate Coding* ou codificação por limiar direto.
-2. **Neurônio Leaky Integrate-and-Fire (LIF):** Modela o potencial de membrana $U[t]$ com vazamento temporal ($\beta$) e incremento sináptico $W \cdot S[t]$. Quando $U[t] \ge V_{th}$, o neurônio emite um spike e reinicia seu potencial (*soft* ou *hard reset*).
-3. **Surrogate Gradients:** Como o disparo do spike é uma função degrau não-diferenciável, utiliza-se a técnica de gradientes substitutos no backpropagation no tempo (BPTT).
-4. **Quantização Int8:** Redução da pegada de memória e compatibilidade com registradores de 8 bits, convertendo matrizes float32 para matrizes de inteiros calibrados.
-5. **Firmware de Inferência:** Implementação C/C++ sem overhead de frameworks pesados, mantendo vetores de estado de membrana alocados de forma estática para evitar fragmentação de heap.
+1. **Spike Encoding (Temporal / Direct):** Input image channels are normalized and converted into binary spike trains across a discrete time window $T$ (e.g., $T = 8$ to $16$ timesteps) via *Poisson Rate Coding* or Direct Encoding.
+2. **Leaky Integrate-and-Fire (LIF) Neuron:** Models membrane potential $U[t]$ with temporal decay ($\beta$) and synaptic input $W \cdot S[t]$. When $U[t] \ge V_{th}$, the neuron fires a spike and resets its potential (*soft* or *hard reset*).
+3. **Surrogate Gradients:** Since spike firing is a non-differentiable step function, surrogate gradient techniques are employed during Backpropagation Through Time (BPTT).
+4. **Int8 Quantization:** Reduces memory footprint and maps onto 8-bit registers by transforming float32 matrices into calibrated integer arrays.
+5. **Inference Firmware:** Clean C/C++ implementation without runtime framework overhead, keeping membrane state buffers statically allocated to avoid heap fragmentation.
 
 ---
 
-## 📁 Estrutura de Diretórios Planejada
+## 📁 Planned Directory Structure
 
 ```
 SpikeVision-S3/
 │
-├── training/                       # Ambiente de treinamento e prototipagem (Python)
-│   ├── data/                       # Armazenamento e download de datasets (CIFAR-10)
-│   ├── models/                     # Definição das arquiteturas CSNN / LIF (snnTorch/PyTorch)
-│   ├── datasets/                   # Scripts de carregamento, filtragem e codificação de spikes
-│   ├── utils/                      # Métricas, plotagem de disparos e ferramentas auxiliares
-│   ├── train.py                    # Script principal de treinamento e avaliação
-│   ├── quantize_export.py          # Quantização Int8 e geração de cabeçalhos C/C++
-│   └── requirements.txt            # Dependências Python (torch, snntorch, torchvision, etc.)
+├── training/                       # Training and prototyping environment (Python)
+│   ├── data/                       # Dataset storage and downloads (CIFAR-10)
+│   ├── models/                     # CSNN / LIF architecture definitions (snnTorch/PyTorch)
+│   ├── datasets/                   # Loading, filtering, and spike encoding scripts
+│   ├── utils/                      # Metrics, spike activity plots, and helper tools
+│   ├── train.py                    # Main training and evaluation script
+│   ├── quantize_export.py          # Int8 quantization and C/C++ header generator
+│   └── requirements.txt            # Python dependencies (torch, snntorch, torchvision, etc.)
 │
-├── firmware/                       # Código embarcado para o microcontrolador ESP32-S3
-│   ├── main/                       # Código-fonte principal da aplicação
-│   │   ├── main.cpp                # Ponto de entrada do firmware
-│   │   ├── snn_engine.cpp          # Implementação da dinâmica neuronal LIF e convoluções
-│   │   └── snn_engine.h            # Assinaturas e estruturas de dados do motor de inferência
-│   ├── include/                    # Arquivos de cabeçalho compartilhados
-│   │   └── weights.h               # Pesos quantizados e parâmetros do modelo gerados pelo script
-│   ├── test_samples/               # Amostras de validação estática compiladas no firmware
-│   ├── CMakeLists.txt              # Configuração de build (ESP-IDF)
-│   └── platformio.ini              # Configuração para PlatformIO / Arduino (se aplicável)
+├── firmware/                       # Embedded firmware for the ESP32-S3 microcontroller
+│   ├── main/                       # Main application source code
+│   │   ├── main.cpp                # Firmware entry point
+│   │   ├── snn_engine.cpp          # LIF neural dynamics and sparse convolution implementation
+│   │   └── snn_engine.h            # Inference engine data structures and function declarations
+│   ├── include/                    # Shared header files
+│   │   └── weights.h               # Quantized weights and model parameters generated by script
+│   ├── test_samples/               # Static validation test samples compiled into firmware
+│   ├── CMakeLists.txt              # Build configuration (ESP-IDF)
+│   └── platformio.ini              # PlatformIO / Arduino configuration (if applicable)
 │
-├── docs/                           # Documentação técnica, esquemáticos e relatórios de benchmarks
-└── README.md                       # Documentação principal do projeto
+├── docs/                           # Technical documentation, schematics, and benchmark reports
+└── README.md                       # Main project documentation
 ```
 
 ---
 
-## 🗺️ Roadmap de Desenvolvimento
+## 🗺️ Development Roadmap
 
-- [x] **Fase 1: Concepção, Arquitetura e Estruturação Inicial**
-  - [x] Definição de escopo e arquitetura do MVP ("Gato" vs "Não-Gato" em CIFAR-10).
-  - [x] Criação da documentação estruturada do projeto (`README.md`).
-  - [x] Definição do ambiente de desenvolvimento e dependências (`requirements.txt`).
+- [x] **Phase 1: Conceptualization, Architecture & Initial Setup**
+  - [x] Define project scope and MVP architecture ("Cat" vs "Non-Cat" on CIFAR-10).
+  - [x] Establish structured documentation (`README.md`).
+  - [x] Configure development environment and dependencies (`requirements.txt`).
 
-- [x] **Fase 2: Pipeline CIFAR-10 e Treinamento da SNN (Host)**
-  - [x] Implementação do carregador e filtro binário CIFAR-10 (`cat` vs `non-cat`).
-  - [x] Implementação da codificação em spikes (Rate Coding temporal e Direct Coding).
-  - [x] Construção do modelo Convolutional SNN (CSNN) com snnTorch (células LIF).
-  - [x] Treinamento com Surrogate Gradient e validação da acurácia e taxa de disparo (*firing rate*).
+- [x] **Phase 2: CIFAR-10 Pipeline & SNN Training (Host)**
+  - [x] Implement CIFAR-10 loader and binary filter (`cat` vs `non-cat`).
+  - [x] Implement spike encoding (temporal Rate Coding and Direct Coding).
+  - [x] Build Convolutional SNN (CSNN) model with snnTorch (LIF cells).
+  - [x] Train with Surrogate Gradients and evaluate accuracy and firing rates.
 
-- [x] **Fase 3: Quantização Int8 e Exportação para C/C++**
-  - [x] Fusão analítica exata de `Conv2d + BatchNorm2d` (preservando 100% da acurácia).
-  - [x] Calibração e quantização simétrica dos pesos sinápticos para `int8_t` e biases/limiares ($V_{th}$) para `int32_t`.
-  - [x] Dinâmica temporal Leaky LIF em Ponto Fixo 16-bit ($\beta = 0.9 \implies (mem \times 58982) \gg 16$).
-  - [x] Simulador bit-accurate em Python validado em 2.000 amostras do conjunto de teste CIFAR-10.
-  - [x] Exportação de `firmware/include/weights.h` compatível com compiladores GCC/G++ do ESP-IDF.
-  - [x] Exportação de `firmware/test_samples/test_samples.h` com 10 amostras de teste para validação bit-a-bit.
-  - [x] Geração do relatório analítico em `training/checkpoints/quantization_report.json`.
+- [x] **Phase 3: Int8 Quantization & C/C++ Export**
+  - [x] Exact analytical folding of `Conv2d + BatchNorm2d` (preserving 100% accuracy).
+  - [x] Symmetric calibration and quantization: synaptic weights to `int8_t`, biases and thresholds ($V_{th}$) to `int32_t`.
+  - [x] 16-bit Fixed-Point Leaky LIF temporal dynamics ($\beta = 0.9 \implies (mem \times 58982) \gg 16$).
+  - [x] Python bit-accurate simulator validated on 2,000 CIFAR-10 test samples.
+  - [x] Export `firmware/include/weights.h` compatible with ESP-IDF GCC/G++ compilers.
+  - [x] Export `firmware/test_samples/test_samples.h` with 10 test samples for bit-exact verification.
+  - [x] Generate analytical summary in `training/checkpoints/quantization_report.json`.
 
-- [x] **Fase 4: Motor de Inferência Embarcado no ESP32-S3**
-  - [x] Desenvolvimento do motor LIF em C/C++ otimizado para o Xtensa LX7 (ESP-IDF e Host Linux).
-  - [x] Convoluções esparsas orientadas a eventos (SOP - Synaptic Operations) sem multiplicações nas Camadas 2, 3 e 4.
-  - [x] Alocação 100% estática na SRAM interna (zero chamadas malloc/heap no loop de inferência).
-  - [x] Validação bit-a-bit contra o Python com 100% de paridade (10/10) nas amostras do CIFAR-10.
-  - [x] Compilação cruzada e verificação com ESP-IDF (`idf.py build`, `spikevision_s3.bin`).
-  - [x] Benchmark completo: latência, taxa de disparo, economia de SOP vs MAC e consumo de SRAM/Flash.
+- [x] **Phase 4: Embedded Inference Engine on ESP32-S3**
+  - [x] Develop C/C++ LIF engine optimized for Xtensa LX7 (supporting both ESP-IDF and Host Linux).
+  - [x] Event-driven sparse convolutions (SOP - Synaptic Operations) without multiplications in Layers 2, 3, and 4.
+  - [x] 100% static memory allocation in internal SRAM (zero `malloc`/heap allocations during inference loops).
+  - [x] Bit-by-bit cross-validation against Python with 100% parity (10/10) on CIFAR-10 samples.
+  - [x] Cross-compilation and verification with ESP-IDF (`idf.py build`, `spikevision_s3.bin`).
+  - [x] Comprehensive benchmarks: latency, firing rate, SOP vs MAC savings, and SRAM/Flash footprint.
 
 ---
 
-## 📊 Resultados Experimentais: Treinamento & Quantização Int8
+## 📊 Experimental Results: Training & Int8 Quantization
 
-### 1. Desempenho no Conjunto de Teste (2.000 Amostras CIFAR-10)
+### 1. Test Set Performance (2,000 CIFAR-10 Samples)
 
-O modelo `SpikeVisionCSNN` foi treinado por 25 épocas no Google Colab e posteriormente quantizado em Int8 com o pipeline analítico da Fase 3. Os resultados obtidos em inferência sobre as 2.000 amostras de teste balanceadas (1.000 Gatos e 1.000 Não-Gatos) foram:
+The `SpikeVisionCSNN` model was trained for 25 epochs on Google Colab and subsequently quantized to Int8 using the analytical Phase 3 pipeline. Inference metrics across the 2,000 balanced test samples (1,000 Cats and 1,000 Non-Cats):
 
-| Métrica | PyTorch Float32 (Treinado) | Simulador Int8 (Ponto Fixo) | Impacto da Quantização |
+| Metric | PyTorch Float32 (Trained) | Int8 Simulator (Fixed-Point) | Quantization Impact |
 | :--- | :---: | :---: | :---: |
-| **Acurácia Global** | **77.50%** (1550/2000) | **77.25%** (1545/2000) | **-0.25%** (apenas 5 amostras) |
-| **F1-Score (Gato)** | **78.22%** | **78.63%** | **+0.41%** |
-| **Precisão (Gato)** | **75.80%** | **74.14%** | -1.66% |
-| **Recall (Gato)** | **80.80%** | **83.70%** | **+2.90%** |
-| **Esparsidade Sináptica** | **80.04%** | **80.07%** | +0.03% |
-| **Concordância (Agreement)**| **100.00%** | **96.45%** (1929/2000) | Alta fidelidade bit-a-bit |
+| **Overall Accuracy** | **77.50%** (1550/2000) | **77.25%** (1545/2000) | **-0.25%** (only 5 samples) |
+| **F1-Score (Cat)** | **78.22%** | **78.63%** | **+0.41%** |
+| **Precision (Cat)** | **75.80%** | **74.14%** | -1.66% |
+| **Recall (Cat)** | **80.80%** | **83.70%** | **+2.90%** |
+| **Synaptic Sparsity** | **80.04%** | **80.07%** | +0.03% |
+| **Agreement** | **100.00%** | **96.45%** (1929/2000) | High bit-exact fidelity |
 
 > [!NOTE]
-> **Super-Esparsidade Neuromórfica (~80%):** Em média, **80.07% dos neurônios permanecem em repouso absoluto** a cada passo de tempo $t$. Como os pulsos entre as camadas 2, 3 e 4 são binários ($s \in \{0, 1\}$), a inferência substitui multiplicações densas (**MAC**) por adições esparsas (**SOP - Synaptic Operations**), garantindo consumo de energia ultra-baixo no microcontrolador.
+> **Neuromorphic Super-Sparsity (~80%):** On average, **80.07% of the neurons remain completely inactive** at each timestep $t$. Since pulses between layers 2, 3, and 4 are binary ($s \in \{0, 1\}$), the inference engine replaces dense multiplications (**MAC**) with sparse additions (**SOP - Synaptic Operations**), guaranteeing ultra-low power consumption on the microcontroller.
 
-### 2. Análise de Memória no ESP32-S3
+### 2. Memory Footprint on ESP32-S3
 
-| Recurso de Hardware | Requisito do Modelo Int8 | Capacidade do ESP32-S3 | Utilização |
+| Hardware Resource | Int8 Model Requirement | ESP32-S3 Capacity | Utilization |
 | :--- | :---: | :---: | :---: |
-| **Memória Flash (ROM)** | **15.24 KB** (15.608 bytes) | 4 MB / 8 MB / 16 MB | **< 0.4%** |
-| **SRAM Pico (Membranas + Buffers)** | **48.51 KB** (49.674 bytes) | 512 KB (SRAM Interna) | **9.47%** (463.5 KB Livres!) |
+| **Flash Memory (ROM)** | **15.24 KB** (15,608 bytes) | 4 MB / 8 MB / 16 MB | **< 0.4%** |
+| **Peak SRAM (Membranes + Buffers)** | **48.51 KB** (49,674 bytes) | 512 KB (Internal SRAM) | **9.47%** (463.5 KB Free!) |
 
-*O modelo cabe com **90.5% de folga na SRAM interna ultrarrápida**, sem necessidade de alocação dinâmica em PSRAM externa.*
+*The model fits with **90.5% headroom in high-speed internal SRAM**, completely avoiding external PSRAM overhead.*
 
-### 3. Validação Cruzada Bit-a-Bit (C++ vs Simulador Python)
+### 3. Bit-by-Bit Cross-Validation (C++ vs Python Simulator)
 
-O motor neuromórfico em C/C++ (`firmware/main/snn_engine.cpp`) foi validado diretamente contra as 10 amostras reais do CIFAR-10 exportadas em `test_samples.h`. O teste confirmou **100% de paridade bit-a-bit (10/10 PASS)** em todas as saídas de spikes e potenciais de membrana até o último bit:
+The C/C++ neuromorphic engine (`firmware/main/snn_engine.cpp`) was validated against 10 real CIFAR-10 test samples exported in `test_samples.h`. Tests confirmed **100% bit-exact parity (10/10 PASS)** across all spike outputs and membrane potentials down to the last bit:
 
-| Amostra | Rótulo Real | Predição SNN | Spikes `[Non-Cat, Cat]` | Membrana Final `[Non-Cat, Cat]` | Esparsidade | SOPs Ativas | Latência (Host) | Status |
+| Sample | Ground Truth | SNN Prediction | Spikes `[Non-Cat, Cat]` | Final Membrane `[Non-Cat, Cat]` | Sparsity | Active SOPs | Latency (Host) | Status |
 | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
-| **#00** | GATO | GATO | `[2, 4]` | `[-4, 2849]` | 82.2% | 1.904.968 | 2.42 ms | ✅ **PASS (100% Bit-Accurate)** |
-| **#01** | GATO | GATO | `[0, 7]` | `[-4532, 9726]` | 83.4% | 1.758.184 | 2.28 ms | ✅ **PASS (100% Bit-Accurate)** |
-| **#02** | GATO | NAO-GATO | `[5, 4]` | `[733, 2206]` | 85.6% | 1.492.892 | 1.81 ms | ✅ **PASS (100% Bit-Accurate)** |
-| **#03** | GATO | GATO | `[0, 7]` | `[-5931, 11534]` | 79.3% | 2.215.928 | 2.57 ms | ✅ **PASS (100% Bit-Accurate)** |
-| **#04** | GATO | GATO | `[0, 6]` | `[471, 5133]` | 76.8% | 2.645.420 | 3.19 ms | ✅ **PASS (100% Bit-Accurate)** |
-| **#05** | NAO-GATO | GATO | `[0, 7]` | `[-6676, 11994]` | 84.5% | 1.640.206 | 1.95 ms | ✅ **PASS (100% Bit-Accurate)** |
-| **#06** | NAO-GATO | NAO-GATO | `[7, 2]` | `[5880, 832]` | 75.8% | 2.758.118 | 2.57 ms | ✅ **PASS (100% Bit-Accurate)** |
-| **#07** | NAO-GATO | NAO-GATO | `[7, 0]` | `[8470, -5962]` | 78.2% | 2.563.924 | 1.18 ms | ✅ **PASS (100% Bit-Accurate)** |
-| **#08** | NAO-GATO | NAO-GATO | `[8, 0]` | `[8391, -6056]` | 70.9% | 3.489.360 | 1.54 ms | ✅ **PASS (100% Bit-Accurate)** |
-| **#09** | NAO-GATO | NAO-GATO | `[7, 0]` | `[12224, -9929]` | 78.6% | 2.513.914 | 1.21 ms | ✅ **PASS (100% Bit-Accurate)** |
+| **#00** | CAT | CAT | `[2, 4]` | `[-4, 2849]` | 82.2% | 1,904,968 | 2.42 ms | ✅ **PASS (100% Bit-Accurate)** |
+| **#01** | CAT | CAT | `[0, 7]` | `[-4532, 9726]` | 83.4% | 1,758,184 | 2.28 ms | ✅ **PASS (100% Bit-Accurate)** |
+| **#02** | CAT | NON-CAT | `[5, 4]` | `[733, 2206]` | 85.6% | 1,492,892 | 1.81 ms | ✅ **PASS (100% Bit-Accurate)** |
+| **#03** | CAT | CAT | `[0, 7]` | `[-5931, 11534]` | 79.3% | 2,215,928 | 2.57 ms | ✅ **PASS (100% Bit-Accurate)** |
+| **#04** | CAT | CAT | `[0, 6]` | `[471, 5133]` | 76.8% | 2,645,420 | 3.19 ms | ✅ **PASS (100% Bit-Accurate)** |
+| **#05** | NON-CAT | CAT | `[0, 7]` | `[-6676, 11994]` | 84.5% | 1,640,206 | 1.95 ms | ✅ **PASS (100% Bit-Accurate)** |
+| **#06** | NON-CAT | NON-CAT | `[7, 2]` | `[5880, 832]` | 75.8% | 2,758,118 | 2.57 ms | ✅ **PASS (100% Bit-Accurate)** |
+| **#07** | NON-CAT | NON-CAT | `[7, 0]` | `[8470, -5962]` | 78.2% | 2,563,924 | 1.18 ms | ✅ **PASS (100% Bit-Accurate)** |
+| **#08** | NON-CAT | NON-CAT | `[8, 0]` | `[8391, -6056]` | 70.9% | 3,489,360 | 1.54 ms | ✅ **PASS (100% Bit-Accurate)** |
+| **#09** | NON-CAT | NON-CAT | `[7, 0]` | `[12224, -9929]` | 78.6% | 2,513,914 | 1.21 ms | ✅ **PASS (100% Bit-Accurate)** |
 
 > [!TIP]
-> **Economia de Operações Sinápticas (SOP vs MAC):**
-> Uma rede convolucional densa equivalente executaria **14.606.336 MACs** por inferência. Graças à esparsidade neuromórfica média de **79.52%**, o motor SpikeVision-S3 executa apenas **2.298.292 SOPs** (exclusivamente adições de inteiros nas camadas esparsas), representando uma **redução de 81.24% na carga computacional**.
+> **Synaptic Operations Savings (SOP vs MAC):**
+> An equivalent dense convolutional network would execute **14,606,336 MACs** per inference. Thanks to the average neuromorphic sparsity of **79.52%**, the SpikeVision-S3 engine executes only **2,298,292 SOPs** (pure integer additions in sparse layers), delivering an **81.24% reduction in computational workload**.
 
-### 4. Compilação e Relatório Oficial ESP-IDF (`idf.py size`)
+### 4. Compilation & Official ESP-IDF Memory Report (`idf.py size`)
 
-O projeto foi compilado para o alvo **ESP32-S3** com o toolchain oficial do ESP-IDF (GCC Xtensa LX7 com `-O3` e CPU @ 240 MHz). Relatório de memória extraído do binário `firmware/build/spikevision_s3.bin`:
+The project was compiled for the **ESP32-S3** target using the official ESP-IDF toolchain (GCC Xtensa LX7 with `-O3` and CPU @ 240 MHz). Memory breakdown extracted from the binary `firmware/build/spikevision_s3.bin`:
 
 ```text
                            Memory Type Usage Summary                            
@@ -208,15 +208,15 @@ O projeto foi compilado para o alvo **ESP32-S3** com o toolchain oficial do ESP-
 │ Flash Data (.ro)  │        86988 │          │                │               │
 │ Flash Code (.text)│        67796 │          │                │               │
 └───────────────────┴──────────────┴──────────┴────────────────┴───────────────┘
-Total Image Size: 213.474 bytes (~208 KB em Flash de 1 MB, 80% livre)
-Alocação no Loop de Inferência: 0 bytes (Zero chamadas malloc/heap)
+Total Image Size: 213,474 bytes (~208 KB in 1 MB Flash, ~80% free)
+Inference Loop Dynamic Allocation: 0 bytes (Zero malloc/heap calls)
 ```
 
-### 5. Resultados & Benchmarks no Hardware Real (ESP32-S3 Revisão 2)
+### 5. Physical Hardware Benchmarks (ESP32-S3 Silicon Revision 2)
 
-O firmware foi gravado e validado em uma placa física **ESP32-S3 (Revisão de Silício 2, Dual-Core Xtensa LX7 @ 240 MHz)** conectada via porta serial `/dev/ttyACM0`. 
+The firmware was flashed and evaluated on a physical **ESP32-S3 (Silicon Revision 2, Dual-Core Xtensa LX7 @ 240 MHz)** board connected via serial port `/dev/ttyACM0`. 
 
-Abaixo está o log de execução real capturado diretamente da porta serial da placa:
+Below is the execution log captured directly from the board's serial port:
 
 ```text
 ================================================================================
@@ -229,149 +229,149 @@ Abaixo está o log de execução real capturado diretamente da porta serial da p
          Neuromorphic Event-Driven SNN Engine for Cat/Non-Cat Classification    
 ================================================================================
 🔧 [ESP32-S3 Hardware Info]:
-  • Modelo do Chip:       ESP32-S3 (Revisão 2)
-  • Núcleos de CPU:       2 Cores Xtensa LX7 @ 240 MHz
-  • Recursos:             Wi-Fi BLE External Flash
-  • Heap Interno Livre:   222052 bytes
-  • Heap Total Livre:     222052 bytes
-  • Consumo SRAM Motor:   166416 bytes (162.52 KB) [100% Estática, 0 Heap]
-  • Ocupação ROM Pesos:   15608 bytes (15.24 KB)
+  • Chip Model:           ESP32-S3 (Revision 2)
+  • CPU Cores:            2 Cores Xtensa LX7 @ 240 MHz
+  • Features:             Wi-Fi BLE External Flash
+  • Free Internal Heap:   222052 bytes
+  • Free Total Heap:      222052 bytes
+  • Engine SRAM Usage:    166416 bytes (162.52 KB) [100% Static, 0 Heap]
+  • Weights ROM Usage:    15608 bytes (15.24 KB)
 
-🚀 [Executando Bateria de Testes nas 10 Amostras do CIFAR-10]...
+🚀 [Executing Test Suite on 10 CIFAR-10 Samples]...
 ------------------------------------------------------------------------------------------------------------------------------------
-| ID | Ground-Truth | Pred SNN | Spikes [N, C] | Membrana Final   | Esparsidade | SOPs Ativas | Latência  | Ciclos CPU | Status       |
+| ID | Ground-Truth | Pred SNN | Spikes [N, C] | Final Membrane   | Sparsity    | Active SOPs | Latency   | CPU Cycles | Status       |
 ------------------------------------------------------------------------------------------------------------------------------------
-| 00 | GATO         | GATO     |   [2, 4]     | [    -4,   2849] |    82.2%    |    1904968  |  114.76 ms |   27542348 | PASS (BIT-ACC) |
-| 01 | GATO         | GATO     |   [0, 7]     | [ -4532,   9726] |    83.4%    |    1758184  |  108.80 ms |   26111647 | PASS (BIT-ACC) |
-| 02 | GATO         | NAO-GATO |   [5, 4]     | [   733,   2206] |    85.6%    |    1492892  |  100.16 ms |   24037447 | PASS (BIT-ACC) |
-| 03 | GATO         | GATO     |   [0, 7]     | [ -5931,  11534] |    79.3%    |    2215928  |  123.97 ms |   29753809 | PASS (BIT-ACC) |
-| 04 | GATO         | GATO     |   [0, 6]     | [   471,   5133] |    76.8%    |    2645420  |  138.07 ms |   33136333 | PASS (BIT-ACC) |
-| 05 | NAO-GATO     | GATO     |   [0, 7]     | [ -6676,  11994] |    84.5%    |    1640206  |  104.93 ms |   25183504 | PASS (BIT-ACC) |
-| 06 | NAO-GATO     | NAO-GATO |   [7, 2]     | [  5880,    832] |    75.8%    |    2758118  |  141.98 ms |   34074613 | PASS (BIT-ACC) |
-| 07 | NAO-GATO     | NAO-GATO |   [7, 0]     | [  8470,  -5962] |    78.2%    |    2563924  |  135.63 ms |   32551867 | PASS (BIT-ACC) |
-| 08 | NAO-GATO     | NAO-GATO |   [8, 0]     | [  8391,  -6056] |    70.9%    |    3489360  |  166.03 ms |   39846877 | PASS (BIT-ACC) |
-| 09 | NAO-GATO     | NAO-GATO |   [7, 0]     | [ 12224,  -9929] |    78.6%    |    2513914  |  133.68 ms |   32082733 | PASS (BIT-ACC) |
+| 00 | CAT          | CAT      |   [2, 4]     | [    -4,   2849] |    82.2%    |    1904968  |  114.76 ms |   27542348 | PASS (BIT-ACC) |
+| 01 | CAT          | CAT      |   [0, 7]     | [ -4532,   9726] |    83.4%    |    1758184  |  108.80 ms |   26111647 | PASS (BIT-ACC) |
+| 02 | CAT          | NON-CAT  |   [5, 4]     | [   733,   2206] |    85.6%    |    1492892  |  100.16 ms |   24037447 | PASS (BIT-ACC) |
+| 03 | CAT          | CAT      |   [0, 7]     | [ -5931,  11534] |    79.3%    |    2215928  |  123.97 ms |   29753809 | PASS (BIT-ACC) |
+| 04 | CAT          | CAT      |   [0, 6]     | [   471,   5133] |    76.8%    |    2645420  |  138.07 ms |   33136333 | PASS (BIT-ACC) |
+| 05 | NON-CAT      | CAT      |   [0, 7]     | [ -6676,  11994] |    84.5%    |    1640206  |  104.93 ms |   25183504 | PASS (BIT-ACC) |
+| 06 | NON-CAT      | NON-CAT  |   [7, 2]     | [  5880,    832] |    75.8%    |    2758118  |  141.98 ms |   34074613 | PASS (BIT-ACC) |
+| 07 | NON-CAT      | NON-CAT  |   [7, 0]     | [  8470,  -5962] |    78.2%    |    2563924  |  135.63 ms |   32551867 | PASS (BIT-ACC) |
+| 08 | NON-CAT      | NON-CAT  |   [8, 0]     | [  8391,  -6056] |    70.9%    |    3489360  |  166.03 ms |   39846877 | PASS (BIT-ACC) |
+| 09 | NON-CAT      | NON-CAT  |   [7, 0]     | [ 12224,  -9929] |    78.6%    |    2513914  |  133.68 ms |   32082733 | PASS (BIT-ACC) |
 ------------------------------------------------------------------------------------------------------------------------------------
 
-📊 [Resumo de Benchmark e Validação Cruzada]:
-  • Paridade Bit-a-Bit C++/Python:   10/10 (100%)
-  • Acurácia nas Amostras CIFAR-10:  8/10 (80%)
-  • Latência Média por Inferência:   126.80 ms (7.9 FPS)
-  • Esparsidade Média da Rede:       79.52% (Neurônios em Silêncio)
-  • Operações Sinápticas (SOPs):     2298292 SOPs (Média por Inferência)
-  • Operações Dense MAC Equivalente: 14606336 MACs
-  • Redução de Carga Computacional:  81.24% de Economia de Hardware!
-  • Memória Flash Necessária:        ~15.24 KB
-  • Memória SRAM Interna Necessária: ~162.50 KB (100% alocação estática)
+📊 [Benchmark & Cross-Validation Summary]:
+  • C++/Python Bit-by-Bit Parity:    10/10 (100%)
+  • Accuracy on CIFAR-10 Samples:    8/10 (80%)
+  • Mean Latency per Inference:      126.80 ms (7.9 FPS)
+  • Mean Network Sparsity:           79.52% (Silent Neurons)
+  • Synaptic Operations (SOPs):      2298292 SOPs (Mean per Inference)
+  • Equivalent Dense MAC Operations: 14606336 MACs
+  • Workload Reduction:              81.24% Hardware Savings!
+  • Flash Memory Required:           ~15.24 KB
+  • Internal SRAM Required:          ~162.50 KB (100% static allocation)
 
-✔ SUCESSO ABSOLUTO: Todas as 10 amostras apresentaram 100% de paridade bit-a-bit!
+✔ ABSOLUTE SUCCESS: All 10 samples demonstrated 100% bit-exact parity!
 
-I (1773) SPIKEVISION_S3: SpikeVision-S3 Neuromorphic Engine executado com sucesso.
+I (1773) SPIKEVISION_S3: SpikeVision-S3 Neuromorphic Engine executed successfully.
 I (2783) main_task: Returned from app_main()
 ```
 
-#### 💡 Análise do Comportamento Neuromórfico no Silício
+#### 💡 Neuromorphic Silicon Behavior Analysis
 
-1. **Latência Dinâmica Proporcional à Esparsidade (*Event-Driven Computing*):**
-   Diferente das ANNs densas convencionais onde o tempo de processamento é fixo e determinístico independentemente do conteúdo da imagem, no **SpikeVision-S3 o tempo de inferência varia dinamicamente conforme a atividade de disparo**:
-   * **Amostra #02 (Alta Esparsidade - 85.6%):** Apenas 1.492.892 SOPs ativas resultaram em uma latência de **100.16 ms** (24.037.447 ciclos de CPU).
-   * **Amostra #08 (Menor Esparsidade - 70.9%):** Disparou 3.489.360 SOPs ativas, elevando o tempo para **166.03 ms** (39.846.877 ciclos de CPU).
-   * **Conclusão Prática:** Quando há menos eventos sinápticos disparados, a CPU simplesmente não processa convoluções esparsas, poupando **~40% dos ciclos de clock** nas amostras mais esparsas. Essa é a comprovação empírica da eficiência energética da computação neuromórfica em microcontroladores!
+1. **Dynamic Latency Proportional to Sparsity (*Event-Driven Computing*):**
+   Unlike conventional dense ANNs where execution time is fixed and deterministic regardless of image contents, in **SpikeVision-S3 inference time scales dynamically based on spike activity**:
+   * **Sample #02 (High Sparsity - 85.6%):** Only 1,492,892 active SOPs resulted in a latency of **100.16 ms** (24,037,447 CPU cycles).
+   * **Sample #08 (Lower Sparsity - 70.9%):** Fired 3,489,360 active SOPs, increasing latency to **166.03 ms** (39,846,877 CPU cycles).
+   * **Practical Takeaway:** When fewer synaptic events fire, the CPU skips sparse convolution processing altogether, saving **~40% of clock cycles** on high-sparsity inputs. This provides empirical validation of the energy efficiency inherent to neuromorphic edge computing!
 
-2. **Paridade Bit-a-Bit Perfeita (100%):**
-   Todos os valores de potenciais de membrana $U[t]$ e contadores de spikes $S[t]$ observados no hardware real bateram exatamente com o simulador bit-accurate em Python e o teste no Host Linux, demonstrando estabilidade numérica total com ponto fixo e sem erros de arredondamento.
+2. **Flawless Bit-Exact Parity (100%):**
+   Every membrane potential $U[t]$ and spike count $S[t]$ observed on physical silicon matched the bit-accurate Python simulator and host Linux test suite down to the exact bit, demonstrating complete numerical stability with fixed-point arithmetic and zero round-off drift.
 
-3. **Gerenciamento de Memória Impecável:**
-   * **Zero Fragmentação:** O motor aloca seus buffers de membrana de forma 100% estática (`162.52 KB`), deixando **222.052 bytes livres de Heap interno** no ESP32-S3 para aplicações do usuário (Wi-Fi, Bluetooth, captura de câmera OV2640, MQTT, etc.).
-   * **Pegada de Flash Mínima:** Apenas **15.24 KB** para todos os pesos e limiares quantizados em Int8/Int32.
+3. **Zero-Fragmentation Memory Management:**
+   * **Zero Dynamic Allocation:** The engine allocates its membrane buffers 100% statically (`162.52 KB`), leaving **222,052 bytes of internal Heap free** on the ESP32-S3 for user applications (Wi-Fi, Bluetooth, OV2640 camera capture, MQTT, etc.).
+   * **Minimal Flash Footprint:** Only **15.24 KB** for all quantized Int8/Int32 weights and thresholds.
 
 ---
 
-## 🚀 Como Executar o Projeto (Passo a Passo)
+## 🚀 How to Run the Project (Step-by-Step)
 
-O pipeline do SpikeVision-S3 foi projetado de ponta a ponta para ser totalmente reprodutível, cobrindo desde o treinamento da rede neural até a gravação no silício:
+The SpikeVision-S3 pipeline is designed end-to-end to be fully reproducible, from neural network training to flashing real hardware:
 
-### Passo 1: Treinamento da SNN (Local ou Google Colab)
+### Step 1: SNN Training (Local or Google Colab)
 
-Você pode treinar o modelo `SpikeVisionCSNN` tanto localmente quanto acelerado por GPU no Google Colab:
+You can train the `SpikeVisionCSNN` model either locally or GPU-accelerated on Google Colab:
 
-* **Treinamento Local (Host):**
+* **Local Training (Host):**
   ```bash
-  # Criar e ativar ambiente virtual
+  # Create and activate virtual environment
   python3 -m venv venv
   source venv/bin/activate
   pip install -r training/requirements.txt
 
-  # Executar o treinamento (CIFAR-10 Cat vs Non-Cat por 25 épocas)
+  # Run training (CIFAR-10 Cat vs Non-Cat for 25 epochs)
   python3 training/train.py
   ```
 
-* **Treinamento no Google Colab (GPU A100/T4):**
-  Utilize o script pronto [`training/colab_train.py`](file:///home/john/Programacao/Estudos/SpikeVision-S3/training/colab_train.py), que faz o download do dataset, treina com PyTorch + snnTorch, e salva os pesos em `training/checkpoints/best_spikevision_csnn.pth`.
+* **Google Colab Training (A100/T4 GPU):**
+  Use the ready-to-run script [`training/colab_train.py`](file:///home/john/Programacao/Estudos/SpikeVision-S3/training/colab_train.py), which downloads the dataset, trains via PyTorch + snnTorch, and saves model checkpoints to `training/checkpoints/best_spikevision_csnn.pth`.
 
 ---
 
-### Passo 2: Quantização Int8 e Exportação C/C++
+### Step 2: Int8 Quantization & C/C++ Export
 
-O script de quantização funde as camadas de normalização (`Conv + BatchNorm`), quantiza os pesos para `int8_t` e biases/limiares para `int32_t`, valida a precisão bit-a-bit e gera os cabeçalhos para o firmware:
+The quantization script analytically folds normalization layers (`Conv + BatchNorm`), quantizes weights to `int8_t` and biases/thresholds to `int32_t`, validates bit-level precision, and outputs C/C++ firmware headers:
 
 ```bash
 python3 training/quantize_export.py
 ```
 
-* **Arquivos Gerados/Atualizados:**
-  * [`firmware/include/weights.h`](file:///home/john/Programacao/Estudos/SpikeVision-S3/firmware/include/weights.h) — Matrizes de pesos em formato C, declaradas em `FLASH_ATTR` / `const`.
-  * [`firmware/test_samples/test_samples.h`](file:///home/john/Programacao/Estudos/SpikeVision-S3/firmware/test_samples/test_samples.h) — 10 imagens reais de teste com rótulos e ground-truth.
-  * [`training/checkpoints/quantization_report.json`](file:///home/john/Programacao/Estudos/SpikeVision-S3/training/checkpoints/quantization_report.json) — Relatório de métricas de degradação e ocupação.
+* **Generated / Updated Files:**
+  * [`firmware/include/weights.h`](file:///home/john/Programacao/Estudos/SpikeVision-S3/firmware/include/weights.h) — C-format weight arrays declared with `FLASH_ATTR` / `const`.
+  * [`firmware/test_samples/test_samples.h`](file:///home/john/Programacao/Estudos/SpikeVision-S3/firmware/test_samples/test_samples.h) — 10 real test images with labels and ground-truth data.
+  * [`training/checkpoints/quantization_report.json`](file:///home/john/Programacao/Estudos/SpikeVision-S3/training/checkpoints/quantization_report.json) — Degradation metrics and memory analysis report.
 
 ---
 
-### Passo 3: Validação Rápida no Host Linux (G++)
+### Step 3: Fast Host Validation on Linux (G++)
 
-Antes de gravar no microcontrolador, você pode validar a lógica do motor em C++ e a paridade bit-a-bit em seu próprio PC Linux usando o GCC:
+Before flashing to hardware, you can verify engine logic and bit-exact parity locally on your Linux machine using GCC:
 
 ```bash
 cd firmware
 make test
 ```
-*Compila em ~1 segundo com `g++ -O3` e executa a verificação bit-a-bit das 10 amostras exibindo a tabela completa de benchmarks.*
+*Compiles in ~1 second with `g++ -O3` and runs the bit-exact verification suite across 10 samples, displaying the full benchmark table.*
 
 ---
 
-### Passo 4: Compilação, Gravação e Monitoramento no ESP32-S3 (ESP-IDF)
+### Step 4: Build, Flash, and Monitor on ESP32-S3 (ESP-IDF)
 
-Com o microcontrolador ESP32-S3 conectado à porta USB (ex: `/dev/ttyACM0`):
+With the ESP32-S3 connected via USB (e.g., `/dev/ttyACM0`):
 
 ```bash
-# 1. Carregar variáveis de ambiente do ESP-IDF
+# 1. Export ESP-IDF environment variables
 source ~/esp/esp-idf/export.sh
 
-# 2. Navegar para a pasta do firmware e definir o target
+# 2. Navigate to firmware directory and set target
 cd firmware
 idf.py set-target esp32s3
 
-# 3. Compilar o projeto com otimização -O3
+# 3. Build project with -O3 optimization
 idf.py build
 
-# 4. Gravar na placa e abrir o monitor serial interativo
+# 4. Flash to board and launch interactive serial monitor
 idf.py -p /dev/ttyACM0 flash monitor
 ```
 
 > [!TIP]
-> Para sair do monitor serial do ESP-IDF, pressione o atalho `Ctrl + ]`.
+> To exit the ESP-IDF serial monitor, press `Ctrl + ]`.
 
 ---
 
-## 🛠️ Tecnologias & Ferramentas
+## 🛠️ Technologies & Tools
 
-* **Linguagens:** Python 3.10+, C/C++ (C++17)
-* **Frameworks de ML/SNN:** [PyTorch](https://pytorch.org/), [snnTorch](https://snntorch.readthedocs.io/)
-* **Hardware Alvo:** Espressif ESP32-S3 (Dual-Core Xtensa 32-bit LX7 @ 240MHz, 512KB SRAM)
-* **Framework Embarcado:** ESP-IDF / PlatformIO (Arduino Core)
-* **Otimizações de Hardware:** ESP-DSP / ESP-NN (instruções SIMD)
+* **Languages:** Python 3.10+, C/C++ (C++17)
+* **ML / SNN Frameworks:** [PyTorch](https://pytorch.org/), [snnTorch](https://snntorch.readthedocs.io/)
+* **Target Hardware:** Espressif ESP32-S3 (Dual-Core Xtensa 32-bit LX7 @ 240 MHz, 512 KB SRAM)
+* **Embedded Frameworks:** ESP-IDF / PlatformIO (Arduino Core)
+* **Hardware Optimizations:** ESP-DSP / ESP-NN (SIMD instructions)
 
 ---
 
-## 📜 Licença
+## 📜 License
 
-Este projeto é desenvolvido para fins educacionais e de pesquisa em computação neuromórfica e Edge AI sob a licença [MIT](LICENSE).
+This project is developed for educational and research purposes in neuromorphic computing and Edge AI under the [MIT](LICENSE) license.
