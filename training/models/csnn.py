@@ -18,21 +18,21 @@ from training.datasets.cifar10_cat import encode_spikes
 
 class SpikeVisionCSNN(nn.Module):
     """
-    Convolutional Spiking Neural Network (CSNN) para classificação binária (Gato vs Não-Gato).
+    Convolutional Spiking Neural Network (CSNN) para classificação CIFAR-10 (10 classes).
 
     Estrutura:
         - Layer 1: Conv2d(in_channels, 16, 3x3, pad=1, bias=False) -> BatchNorm2d(16) -> MaxPool2d(2) -> Leaky LIF
         - Layer 2: Conv2d(16, 32, 3x3, pad=1, bias=False) -> BatchNorm2d(32) -> MaxPool2d(2) -> Leaky LIF
         - Layer 3: Conv2d(32, 32, 3x3, pad=1, bias=False) -> BatchNorm2d(32) -> MaxPool2d(2) -> Leaky LIF
-        - Head: Flatten -> Linear(32 * 4 * 4, 2, bias=False) -> Leaky LIF
+        - Head: Flatten -> Linear(32 * 4 * 4, num_classes, bias=False) -> Leaky LIF
 
-    Total de Parâmetros: ~15.400 (~15.4 KB em Int8).
+    Total de Parâmetros: ~19.500 (~19.5 KB em Int8) para 10 classes; ~15.400 (~15.4 KB em Int8) para 2 classes.
     """
 
     def __init__(
         self,
         in_channels: int = 3,
-        num_classes: int = 2,
+        num_classes: int = 10,
         beta: float = 0.9,
         slope: float = 25.0,
     ):
@@ -151,8 +151,8 @@ class SpikeVisionCSNN(nn.Module):
                 spk_count_l3 += spk3.detach().sum().item()
                 spk_count_l4 += spk4.detach().sum().item()
 
-        spk_out = torch.stack(spk_out_rec, dim=0)  # [T, B, 2]
-        mem_out = torch.stack(mem_out_rec, dim=0)  # [T, B, 2]
+        spk_out = torch.stack(spk_out_rec, dim=0)  # [T, B, num_classes]
+        mem_out = torch.stack(mem_out_rec, dim=0)  # [T, B, num_classes]
 
         if not return_sparsity:
             return spk_out, mem_out
@@ -237,3 +237,15 @@ def print_model_summary(model: nn.Module):
     print(f"Tamanho em Float32:       {stats['float32_kb']:.2f} KB")
     print(f"Tamanho estimado em Int8: {stats['int8_kb']:.2f} KB  <-- [Excelente p/ 512 KB SRAM do S3]")
     print("=" * 72)
+
+
+if __name__ == "__main__":
+    model = SpikeVisionCSNN(num_classes=10)
+    print_model_summary(model)
+
+    x = torch.rand(4, 3, 32, 32)
+    spk_out, mem_out, sparsity = model(x, num_steps=8, encoding="rate", return_sparsity=True)
+    print(f"Input shape:      {tuple(x.shape)}")
+    print(f"Spike out shape:  {tuple(spk_out.shape)}  (esperado: (8, 4, 10))")
+    print(f"Mem out shape:    {tuple(mem_out.shape)}  (esperado: (8, 4, 10))")
+    print(f"Overall sparsity: {sparsity['overall_sparsity'] * 100:.2f}%")

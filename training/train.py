@@ -19,7 +19,7 @@ import time
 import json
 import random
 import argparse
-from typing import Dict, Any, Tuple
+from typing import Dict, Any, Tuple, Optional
 
 import numpy as np
 import torch
@@ -31,8 +31,90 @@ from tqdm import tqdm
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 import snntorch.functional as SF
-from training.datasets.cifar10_cat import get_dataloaders
+from training.datasets.cifar10_cat import (
+    get_dataloaders,
+    get_cifar10_cat_dataloaders,
+    get_cifar10_multiclass_dataloaders,
+    CIFAR10_CLASS_NAMES,
+)
 from training.models.csnn import SpikeVisionCSNN, count_parameters, print_model_summary
+
+
+def compute_multiclass_metrics(
+    preds: torch.Tensor,
+    targets: torch.Tensor,
+    num_classes: int = 10,
+    class_names: Any = None,
+) -> Dict[str, Any]:
+    """
+    Calcula acurácia top-1, métricas macro (precisão, recall, f1)
+    e métricas por classe para classificação multi-classe.
+    """
+    if class_names is None:
+        if num_classes == 10:
+            class_names = CIFAR10_CLASS_NAMES
+        else:
+            class_names = [f"class_{i}" for i in range(num_classes)]
+
+    if isinstance(preds, torch.Tensor):
+        preds_np = preds.detach().cpu().numpy()
+    else:
+        preds_np = np.asarray(preds)
+
+    if isinstance(targets, torch.Tensor):
+        targets_np = targets.detach().cpu().numpy()
+    else:
+        targets_np = np.asarray(targets)
+
+    total_samples = len(targets_np)
+    correct = int((preds_np == targets_np).sum())
+    accuracy = correct / max(total_samples, 1)
+
+    per_class_f1 = {}
+    per_class_accuracy = {}
+    precisions = []
+    recalls = []
+    f1s = []
+
+    for c in range(num_classes):
+        c_name = class_names[c] if c < len(class_names) else f"class_{c}"
+        tp = int(((preds_np == c) & (targets_np == c)).sum())
+        fp = int(((preds_np == c) & (targets_np != c)).sum())
+        fn = int(((preds_np != c) & (targets_np == c)).sum())
+        class_total = int((targets_np == c).sum())
+
+        prec = tp / max(tp + fp, 1e-9) if (tp + fp) > 0 else 0.0
+        rec = tp / max(tp + fn, 1e-9) if (tp + fn) > 0 else 0.0
+        f1 = 2.0 * (prec * rec) / max(prec + rec, 1e-9) if (prec + rec) > 0 else 0.0
+        class_acc = tp / max(class_total, 1) if class_total > 0 else 0.0
+
+        per_class_f1[c_name] = float(f1)
+        per_class_accuracy[c_name] = float(class_acc)
+        precisions.append(prec)
+        recalls.append(rec)
+        f1s.append(f1)
+
+    macro_precision = float(np.mean(precisions)) if precisions else 0.0
+    macro_recall = float(np.mean(recalls)) if recalls else 0.0
+    macro_f1 = float(np.mean(f1s)) if f1s else 0.0
+
+    metrics: Dict[str, Any] = {
+        "accuracy": float(accuracy),
+        "macro_precision": macro_precision,
+        "macro_recall": macro_recall,
+        "macro_f1": macro_f1,
+        "per_class_f1": per_class_f1,
+        "per_class_accuracy": per_class_accuracy,
+    }
+
+    # Compatibilidade retroativa para binário / chave gato
+    cat_idx = 3 if num_classes == 10 else 1
+    if cat_idx < num_classes:
+        metrics["cat_precision"] = float(precisions[cat_idx])
+        metrics["cat_recall"] = float(recalls[cat_idx])
+        metrics["cat_f1"] = float(f1s[cat_idx])
+
+    return metrics
 
 
 def set_seed(seed: int = 42):
@@ -116,22 +198,23 @@ def evaluate(
     num_steps: int,
     encoding: str,
     progress_bar: bool = False,
-) -> Dict[str, float]:
+    num_classes: Optional[int] = None,
+) -> Dict[str, Any]:
     """
     Avalia a SNN em um conjunto de validação ou teste.
 
-    Calcula Acurácia, Loss, Precisão, Recall e F1-Score da classe 'Gato' (1),
+    Calcula Acurácia, Loss, Macro-Precision, Macro-Recall, Macro-F1,
     além da taxa de disparo médio e esparsidade sináptica.
     """
     model.eval()
     total_loss = 0.0
     total_samples = 0
-    correct = 0
 
-    tp = 0  # Verdadeiros Positivos (Gato)
-    fp = 0  # Falsos Positivos
-    fn = 0  # Falsos Negativos
-    tn = 0  # Verdadeiros Negativos
+    if num_classes is None:
+        num_classes = getattr(model, "num_classes", 10)
+
+    all_preds = []
+    all_targets = []
 
     layer_firing_rates = {
         "firing_rate_layer1": [],
@@ -165,43 +248,32 @@ def evaluate(
             if no_spike_mask.any():
                 preds[no_spike_mask] = mem_out[-1, no_spike_mask].argmax(dim=1)
 
-            correct += (preds == targets).sum().item()
+            all_preds.append(preds.cpu())
+            all_targets.append(targets.cpu())
             total_samples += targets.size(0)
-
-            # Métricas da classe 'Gato' (1)
-            for p, t in zip(preds.cpu().numpy(), targets.cpu().numpy()):
-                if t == 1 and p == 1:
-                    tp += 1
-                elif t == 0 and p == 1:
-                    fp += 1
-                elif t == 1 and p == 0:
-                    fn += 1
-                elif t == 0 and p == 0:
-                    tn += 1
 
             for k in layer_firing_rates:
                 if k in sparsity_dict:
                     layer_firing_rates[k].append(sparsity_dict[k])
 
     avg_loss = total_loss / max(total_samples, 1)
-    acc = correct / max(total_samples, 1)
 
-    precision = tp / max(tp + fp, 1e-9)
-    recall = tp / max(tp + fn, 1e-9)
-    f1 = 2 * (precision * recall) / max(precision + recall, 1e-9)
+    if all_preds:
+        cat_preds = torch.cat(all_preds, dim=0)
+        cat_targets = torch.cat(all_targets, dim=0)
+        metrics = compute_multiclass_metrics(cat_preds, cat_targets, num_classes=num_classes)
+    else:
+        metrics = {
+            "accuracy": 0.0,
+            "macro_precision": 0.0,
+            "macro_recall": 0.0,
+            "macro_f1": 0.0,
+            "per_class_f1": {},
+            "per_class_accuracy": {},
+        }
 
-    metrics = {
-        "loss": avg_loss,
-        "accuracy": acc,
-        "cat_precision": precision,
-        "cat_recall": recall,
-        "cat_f1": f1,
-        "tp": tp,
-        "fp": fp,
-        "fn": fn,
-        "tn": tn,
-        "total_samples": total_samples,
-    }
+    metrics["loss"] = avg_loss
+    metrics["total_samples"] = total_samples
 
     for k, v in layer_firing_rates.items():
         metrics[k] = float(np.mean(v)) if v else 0.0
@@ -211,7 +283,7 @@ def evaluate(
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="SpikeVision-S3: Treinamento de CSNN para CIFAR-10 Binário (ESP32-S3)"
+        description="SpikeVision-S3: Treinamento de CSNN para CIFAR-10 (ESP32-S3)"
     )
     parser.add_argument("--epochs", type=int, default=10, help="Número de épocas de treinamento")
     parser.add_argument("--batch-size", type=int, default=64, help="Tamanho do lote")
@@ -226,6 +298,7 @@ def parse_args():
         help="Método de codificação de entrada ('rate' ou 'direct')",
     )
     parser.add_argument("--in-channels", type=int, default=3, choices=[1, 3], help="Canais de entrada: 3 (RGB) ou 1 (Cinza)")
+    parser.add_argument("--num-classes", type=int, default=10, help="Número de classes (10 para CIFAR-10 completo, 2 para binário)")
     parser.add_argument("--data-dir", type=str, default="./training/data", help="Diretório de dados CIFAR-10")
     parser.add_argument("--save-dir", type=str, default="./training/checkpoints", help="Diretório para checkpoints")
     parser.add_argument("--seed", type=int, default=42, help="Seed para reprodutibilidade")
@@ -259,22 +332,44 @@ def main():
     os.makedirs(args.data_dir, exist_ok=True)
 
     # 1. Carregar Dados
-    print(f"\nCarregando dataset CIFAR-10 balanceado (Canais: {args.in_channels}, Batch: {args.batch_size})...")
-    train_loader, test_loader = get_dataloaders(
-        data_dir=args.data_dir,
-        batch_size=args.batch_size,
-        num_workers=args.num_workers,
-        in_channels=args.in_channels,
-        download=not args.no_download,
-        seed=args.seed,
-        smoke_test=args.smoke_test,
-    )
+    if args.num_classes == 10:
+        print(f"\nCarregando dataset CIFAR-10 completo (10 classes, Batch: {args.batch_size})...")
+        train_loader, test_loader = get_cifar10_multiclass_dataloaders(
+            data_dir=args.data_dir,
+            batch_size=args.batch_size,
+            num_workers=args.num_workers,
+            augment=True,
+            download=not args.no_download,
+        )
+        if args.smoke_test:
+            from torch.utils.data import Subset
+            train_loader = torch.utils.data.DataLoader(
+                Subset(train_loader.dataset, list(range(min(len(train_loader.dataset), 64)))),
+                batch_size=args.batch_size,
+                shuffle=True,
+            )
+            test_loader = torch.utils.data.DataLoader(
+                Subset(test_loader.dataset, list(range(min(len(test_loader.dataset), 32)))),
+                batch_size=args.batch_size,
+                shuffle=False,
+            )
+    else:
+        print(f"\nCarregando dataset CIFAR-10 binário balanceado (Canais: {args.in_channels}, Batch: {args.batch_size})...")
+        train_loader, test_loader = get_dataloaders(
+            data_dir=args.data_dir,
+            batch_size=args.batch_size,
+            num_workers=args.num_workers,
+            in_channels=args.in_channels,
+            download=not args.no_download,
+            seed=args.seed,
+            smoke_test=args.smoke_test,
+        )
     print(f"Amostras de Treino: {len(train_loader.dataset):,} | Amostras de Teste: {len(test_loader.dataset):,}")
 
     # 2. Inicializar Modelo
     model = SpikeVisionCSNN(
         in_channels=args.in_channels,
-        num_classes=2,
+        num_classes=args.num_classes,
         beta=args.beta,
         slope=25.0,
     ).to(device)
@@ -292,7 +387,7 @@ def main():
     history = []
 
     print("\nIniciando treinamento SNN:")
-    print(f"Épocas: {args.epochs} | Timesteps (T): {args.num_steps} | Codificação: {args.encoding} | Beta LIF: {args.beta}\n")
+    print(f"Épocas: {args.epochs} | Classes: {args.num_classes} | Timesteps (T): {args.num_steps} | Codificação: {args.encoding} | Beta LIF: {args.beta}\n")
 
     start_total_time = time.time()
 
@@ -318,6 +413,7 @@ def main():
             num_steps=args.num_steps,
             encoding=args.encoding,
             progress_bar=False,
+            num_classes=args.num_classes,
         )
 
         scheduler.step()
@@ -325,9 +421,9 @@ def main():
 
         test_acc = test_metrics["accuracy"]
         test_loss = test_metrics["loss"]
-        f1 = test_metrics["cat_f1"]
-        precision = test_metrics["cat_precision"]
-        recall = test_metrics["cat_recall"]
+        macro_f1 = test_metrics.get("macro_f1", 0.0)
+        macro_p = test_metrics.get("macro_precision", 0.0)
+        macro_r = test_metrics.get("macro_recall", 0.0)
         overall_fr = test_metrics["overall_firing_rate"]
         sparsity = test_metrics["overall_sparsity"]
 
@@ -335,7 +431,7 @@ def main():
             f"Época [{epoch:02d}/{args.epochs:02d}] ({epoch_time:.1f}s) | "
             f"Treino Loss: {train_loss:.4f} Acc: {train_acc*100:5.2f}% | "
             f"Teste Loss: {test_loss:.4f} Acc: {test_acc*100:5.2f}% | "
-            f"Gato F1: {f1:.3f} (P: {precision:.2f}, R: {recall:.2f}) | "
+            f"Macro-F1: {macro_f1:.3f} (P: {macro_p:.2f}, R: {macro_r:.2f}) | "
             f"Esparsidade: {sparsity*100:5.1f}% (Firing: {overall_fr*100:4.1f}%)"
         )
 
@@ -346,9 +442,11 @@ def main():
             "train_firing_rate": train_firing_rate,
             "test_loss": test_loss,
             "test_acc": test_acc,
-            "test_cat_f1": f1,
-            "test_cat_precision": precision,
-            "test_cat_recall": recall,
+            "test_macro_f1": macro_f1,
+            "test_macro_precision": macro_p,
+            "test_macro_recall": macro_r,
+            "test_per_class_f1": test_metrics.get("per_class_f1", {}),
+            "test_per_class_accuracy": test_metrics.get("per_class_accuracy", {}),
             "test_sparsity": sparsity,
             "epoch_time_sec": epoch_time,
         }
@@ -364,7 +462,7 @@ def main():
                 "optimizer_state_dict": optimizer.state_dict(),
                 "config": {
                     "in_channels": args.in_channels,
-                    "num_classes": 2,
+                    "num_classes": args.num_classes,
                     "beta": args.beta,
                     "slope": 25.0,
                     "num_steps": args.num_steps,

@@ -304,28 +304,31 @@ void snn_engine_infer(const uint8_t* image_chw, SNNInferenceResult* result) {
             }
         }
 
-        /* --- CAMADA 4: Head Linear (512 -> 2) Orientada a Spikes ---
-         * Itera sobre os 512 neurônios de saída de spk3 (formato CHW: [32, 4, 4]).
+        /* --- CAMADA 4: Head Linear (FC_IN_FEATURES -> FC_OUT_FEATURES) Orientada a Spikes ---
+         * Itera sobre os FC_IN_FEATURES neurônios de saída de spk3 (formato CHW: [32, 4, 4]).
          * Apenas se o neurônio disparou spike (s==1), somamos os pesos correspondentes.
          */
         int32_t cur4[FC_OUT_FEATURES];
-        cur4[0] = fc_bias[0];
-        cur4[1] = fc_bias[1];
+        for (int c = 0; c < FC_OUT_FEATURES; ++c) {
+            cur4[c] = fc_bias[c];
+        }
 
-        for (int i = 0; i < FC_IN_FEATURES; i++) {
-            int ch = i / 16;
-            int rem = i % 16;
-            int y = rem / 4;
-            int x = rem % 4;
-
-            if (s_spk3[ch][y][x]) {
-                cur4[0] += fc_weights[0 * FC_IN_FEATURES + i];
-                cur4[1] += fc_weights[1 * FC_IN_FEATURES + i];
-                active_sops += 2;
+        int idx = 0;
+        for (int ch = 0; ch < CONV3_OUT_CHANNELS; ++ch) {
+            for (int y = 0; y < 4; ++y) {
+                for (int x = 0; x < 4; ++x) {
+                    if (s_spk3[ch][y][x]) {
+                        for (int c = 0; c < FC_OUT_FEATURES; ++c) {
+                            cur4[c] += (int32_t)fc_weights[c * FC_IN_FEATURES + idx];
+                        }
+                        active_sops += FC_OUT_FEATURES;
+                    }
+                    idx++;
+                }
             }
         }
 
-        /* Camada 4: Leaky LIF (2 Classes) */
+        /* Camada 4: Leaky LIF (FC_OUT_FEATURES Classes) */
         for (int c = 0; c < FC_OUT_FEATURES; c++) {
             int32_t m = s_mem4[c];
             int32_t r = (m >= SPIKEVISION_L4_VTH) ? 1 : 0;
@@ -337,16 +340,23 @@ void snn_engine_infer(const uint8_t* image_chw, SNNInferenceResult* result) {
         }
     }
 
-    /* 5. Decisão de Classificação: Maior contagem de spikes (desempate por potencial final de membrana) */
-    int pred = 0;
-    int32_t diff = s_spk_counts[1] - s_spk_counts[0];
-    if (diff > 0) {
-        pred = 1;
-    } else if (diff < 0) {
-        pred = 0;
-    } else {
-        pred = (s_mem4[1] > s_mem4[0]) ? 1 : 0;
+    /* 5. Decisão de Classificação: Maior contagem de spikes (desempate por maior potencial final de membrana) */
+    for (int c = 0; c < FC_OUT_FEATURES; ++c) {
+        result->spike_counts[c] = s_spk_counts[c];
+        result->final_mem[c]    = s_mem4[c];
     }
+    int best_c = 0;
+    int32_t max_spk = s_spk_counts[0];
+    int32_t best_mem = s_mem4[0];
+    for (int c = 1; c < FC_OUT_FEATURES; ++c) {
+        if (s_spk_counts[c] > max_spk ||
+            (s_spk_counts[c] == max_spk && s_mem4[c] > best_mem)) {
+            max_spk  = s_spk_counts[c];
+            best_mem = s_mem4[c];
+            best_c   = c;
+        }
+    }
+    result->predicted_class = best_c;
 
     /* 6. Medição final de tempo e ciclos */
 #if defined(ESP_PLATFORM)
@@ -359,12 +369,6 @@ void snn_engine_infer(const uint8_t* image_chw, SNNInferenceResult* result) {
 #endif
 
     /* 7. Preenchimento da Estrutura de Retorno */
-    result->predicted_class = pred;
-    result->spike_counts[0] = s_spk_counts[0];
-    result->spike_counts[1] = s_spk_counts[1];
-    result->final_mem[0] = s_mem4[0];
-    result->final_mem[1] = s_mem4[1];
-
     result->total_spikes_l1 = total_spks_l1;
     result->total_spikes_l2 = total_spks_l2;
     result->total_spikes_l3 = total_spks_l3;
@@ -372,27 +376,27 @@ void snn_engine_infer(const uint8_t* image_chw, SNNInferenceResult* result) {
     result->total_spikes = total_spks_l1 + total_spks_l2 + total_spks_l3 + total_spks_l4;
 
     /* Total de avaliações de neurônios:
-     * L1: 4096 * 8 = 32.768
-     * L2: 2048 * 8 = 16.384
-     * L3:  512 * 8 =  4.096
-     * L4:    2 * 8 =     16
-     * Total = 53.264 neurônios avaliados
+     * L1: 4096 * T
+     * L2: 2048 * T
+     * L3:  512 * T
+     * L4: FC_OUT_FEATURES * T
+     * Total = (6656 + FC_OUT_FEATURES) * SPIKEVISION_TIMESTEPS
      */
-    constexpr uint32_t kTotalNeurons = 53264;
-    result->sparsity_percent = 100.0f * (1.0f - ((float)result->total_spikes / (float)kTotalNeurons));
+    const uint32_t total_neurons = (6656 + FC_OUT_FEATURES) * SPIKEVISION_TIMESTEPS;
+    result->sparsity_percent = 100.0f * (1.0f - ((float)result->total_spikes / (float)total_neurons));
 
     /* Total de MACs densos equivalentes:
      * L1: 16 * 32 * 32 * (3 * 3 * 3) = 442.368 (feita 1x)
-     * L2: 8 * (32 * 16 * 16) * (16 * 3 * 3) = 9.437.184
-     * L3: 8 * (32 * 8 * 8) * (32 * 3 * 3) = 4.718.592
-     * L4: 8 * 2 * 512 = 8.192
-     * Total MACs Densos = 14.606.336
+     * L2: T * (32 * 16 * 16) * (16 * 3 * 3) = 9.437.184
+     * L3: T * (32 * 8 * 8) * (32 * 3 * 3) = 4.718.592
+     * L4: T * FC_IN_FEATURES * FC_OUT_FEATURES
+     * Camadas 1..3 = 14.598.144
      */
-    constexpr uint64_t kDenseMacs = 14606336ULL;
-    result->dense_macs = kDenseMacs;
+    const uint64_t dense_macs = 14598144ULL + ((uint64_t)SPIKEVISION_TIMESTEPS * FC_IN_FEATURES * FC_OUT_FEATURES);
+    result->dense_macs = dense_macs;
     result->active_sops = active_sops;
 
     /* Redução de operações: consideramos que em L1 foram 442.368 MACs e nas demais apenas active_sops */
     uint64_t total_ops = active_sops + 442368ULL;
-    result->sop_reduction_percent = 100.0f * (1.0f - ((float)total_ops / (float)kDenseMacs));
+    result->sop_reduction_percent = 100.0f * (1.0f - ((float)total_ops / (float)dense_macs));
 }

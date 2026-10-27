@@ -23,6 +23,20 @@ logger = logging.getLogger(__name__)
 # Índice da classe 'cat' no CIFAR-10
 CIFAR10_CAT_LABEL = 3
 
+# Nomes das 10 classes do CIFAR-10
+CIFAR10_CLASS_NAMES = [
+    "airplane",
+    "automobile",
+    "bird",
+    "cat",
+    "deer",
+    "dog",
+    "frog",
+    "horse",
+    "ship",
+    "truck",
+]
+
 
 class BinaryCatCIFAR10(Dataset):
     """
@@ -241,6 +255,81 @@ def get_dataloaders(
         seed=seed,
         smoke_test=smoke_test,
         smoke_samples=32,
+    )
+
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=batch_size,
+        shuffle=True,
+        num_workers=num_workers,
+        pin_memory=torch.cuda.is_available(),
+        drop_last=False,
+    )
+
+    test_loader = DataLoader(
+        test_dataset,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=num_workers,
+        pin_memory=torch.cuda.is_available(),
+        drop_last=False,
+    )
+
+    return train_loader, test_loader
+
+
+# Alias para retrocompatibilidade
+get_cifar10_cat_dataloaders = get_dataloaders
+
+
+def get_cifar10_multiclass_dataloaders(
+    data_dir: str = "./data",
+    batch_size: int = 64,
+    num_workers: int = 2,
+    augment: bool = True,
+    download: bool = True,
+) -> Tuple[DataLoader, DataLoader]:
+    """
+    Carrega o dataset CIFAR-10 completo com as 10 classes (50.000 treino, 10.000 teste).
+
+    Args:
+        data_dir: Diretório onde o CIFAR-10 será baixado/armazenado.
+        batch_size: Tamanho do lote.
+        num_workers: Número de workers no DataLoader.
+        augment: Se True, aplica RandomCrop(32, pad=4, reflect) e RandomHorizontalFlip.
+        download: Se deve baixar o CIFAR-10 caso não exista.
+
+    Returns:
+        Tupla (train_loader, test_loader).
+    """
+    os.makedirs(data_dir, exist_ok=True)
+
+    train_transforms_list = []
+    if augment:
+        train_transforms_list.extend([
+            transforms.RandomCrop(32, padding=4, padding_mode="reflect"),
+            transforms.RandomHorizontalFlip(),
+        ])
+    # Mantém valores no intervalo [0.0, 1.0] para compatibilidade com encode_spikes
+    train_transforms_list.append(transforms.ToTensor())
+    train_transform = transforms.Compose(train_transforms_list)
+
+    test_transform = transforms.Compose([
+        transforms.ToTensor(),
+    ])
+
+    train_dataset = torchvision.datasets.CIFAR10(
+        root=data_dir,
+        train=True,
+        download=download,
+        transform=train_transform,
+    )
+
+    test_dataset = torchvision.datasets.CIFAR10(
+        root=data_dir,
+        train=False,
+        download=download,
+        transform=test_transform,
     )
 
     train_loader = DataLoader(

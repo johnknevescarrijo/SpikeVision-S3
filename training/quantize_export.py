@@ -31,7 +31,12 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from training.models.csnn import SpikeVisionCSNN
-from training.datasets.cifar10_cat import get_dataloaders
+from training.datasets.cifar10_cat import (
+    get_dataloaders,
+    get_cifar10_cat_dataloaders,
+    get_cifar10_multiclass_dataloaders,
+    CIFAR10_CLASS_NAMES,
+)
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - [%(levelname)s] - %(message)s")
 logger = logging.getLogger(__name__)
@@ -132,6 +137,7 @@ class BitAccurateInt8CSNN:
         self.p3 = quant_params["layer3"]
         self.p4 = quant_params["layer4"]
         self.num_steps = num_steps
+        self.num_classes = self.p4["w_q"].shape[0]
 
         # Tensores para convolução acelerada via PyTorch com aritmética exata inteira
         self.w1_t = self.p1["w_q"].float()
@@ -160,9 +166,9 @@ class BitAccurateInt8CSNN:
             imgs: Tensor Float32 [B, 3, 32, 32] com valores em [0.0, 1.0].
             
         Returns:
-            preds: Tensor [B] com rótulos preditos (0 ou 1).
-            spike_counts: Tensor [B, 2] com contagens totais de spikes na saída.
-            final_mem: Tensor [B, 2] com potencial de membrana final da camada 4.
+            preds: Tensor [B] com rótulos preditos [0 .. num_classes-1].
+            spike_counts: Tensor [B, num_classes] com contagens totais de spikes na saída.
+            final_mem: Tensor [B, num_classes] com potencial de membrana final da camada 4.
             sparsity_metrics: Estatísticas de esparsidade de disparo.
         """
         B = imgs.size(0)
@@ -173,14 +179,14 @@ class BitAccurateInt8CSNN:
         mem1 = torch.zeros((B, 16, 16, 16), dtype=torch.int32)
         mem2 = torch.zeros((B, 32, 8, 8), dtype=torch.int32)
         mem3 = torch.zeros((B, 32, 4, 4), dtype=torch.int32)
-        mem4 = torch.zeros((B, 2), dtype=torch.int32)
+        mem4 = torch.zeros((B, self.num_classes), dtype=torch.int32)
 
         # Na Camada 1 com Direct Coding, a imagem estática pode ser pré-convoluída
         # uma única vez (economia computacional idêntica ao microcontrolador)
         c1 = F.conv2d(x_q, self.w1_t, self.b1_t, padding=1)
         p1 = F.max_pool2d(c1, 2).to(torch.int32)
 
-        spk_counts = torch.zeros((B, 2), dtype=torch.int32)
+        spk_counts = torch.zeros((B, self.num_classes), dtype=torch.int32)
         total_spks_l1 = 0
         total_spks_l2 = 0
         total_spks_l3 = 0
@@ -219,22 +225,27 @@ class BitAccurateInt8CSNN:
 
             spk_counts += s4
 
-        # Decisão de classificação
-        diff = spk_counts[:, 1] - spk_counts[:, 0]
-        preds = torch.zeros(B, dtype=torch.int64)
-        preds[diff > 0] = 1
-        preds[diff < 0] = 0
-
-        # Desempate com potencial de membrana residual final caso haja empate
-        tied = (diff == 0)
-        if tied.any():
-            preds[tied] = (mem4[tied, 1] > mem4[tied, 0]).to(torch.int64)
+        # Regra de decisão multi-classe idêntica à do C++ (maior contagem de spikes;
+        # desempate pelo maior potencial final de membrana mem4)
+        preds = torch.zeros(B, dtype=torch.long)
+        for b in range(B):
+            best_c = 0
+            max_spk = spk_counts[b, 0].item()
+            best_mem = mem4[b, 0].item()
+            for c in range(1, self.num_classes):
+                s = spk_counts[b, c].item()
+                m = mem4[b, c].item()
+                if s > max_spk or (s == max_spk and m > best_mem):
+                    max_spk = s
+                    best_mem = m
+                    best_c = c
+            preds[b] = best_c
 
         # Estatísticas de esparsidade
         n_l1 = self.num_steps * B * (16 * 16 * 16)
         n_l2 = self.num_steps * B * (32 * 8 * 8)
         n_l3 = self.num_steps * B * (32 * 4 * 4)
-        n_l4 = self.num_steps * B * 2
+        n_l4 = self.num_steps * B * self.num_classes
         total_neurons = n_l1 + n_l2 + n_l3 + n_l4
         total_spks = total_spks_l1 + total_spks_l2 + total_spks_l3 + total_spks_l4
 
@@ -256,8 +267,8 @@ class BitAccurateInt8CSNN:
         preds, spk_counts, final_mem, _ = self.forward_batch(img.unsqueeze(0))
         return (
             int(preds[0].item()),
-            [int(spk_counts[0, 0].item()), int(spk_counts[0, 1].item())],
-            [int(final_mem[0, 0].item()), int(final_mem[0, 1].item())],
+            spk_counts[0].cpu().tolist(),
+            final_mem[0].cpu().tolist(),
         )
 
 
@@ -314,27 +325,72 @@ def evaluate_comparison(
     all_f_preds = torch.cat(all_f_preds).numpy()
     all_i_preds = torch.cat(all_i_preds).numpy()
 
+    num_classes = getattr(float_model, "num_classes", int8_sim.num_classes)
+
     def calc_metrics(preds, targets):
-        tp = int(np.sum((preds == 1) & (targets == 1)))
-        fp = int(np.sum((preds == 1) & (targets == 0)))
-        fn = int(np.sum((preds == 0) & (targets == 1)))
-        tn = int(np.sum((preds == 0) & (targets == 0)))
         total = len(targets)
-        acc = float((tp + tn) / total)
-        prec = float(tp / max(tp + fp, 1e-9))
-        rec = float(tp / max(tp + fn, 1e-9))
-        f1 = float(2 * prec * rec / max(prec + rec, 1e-9))
-        return {
+        acc = float(np.sum(preds == targets) / max(total, 1))
+
+        per_class_f1 = {}
+        per_class_accuracy = {}
+        precisions = []
+        recalls = []
+        f1s = []
+
+        class_names = CIFAR10_CLASS_NAMES if num_classes == 10 else [f"class_{i}" for i in range(num_classes)]
+
+        for c in range(num_classes):
+            c_name = class_names[c] if c < len(class_names) else f"class_{c}"
+            tp = int(np.sum((preds == c) & (targets == c)))
+            fp = int(np.sum((preds == c) & (targets != c)))
+            fn = int(np.sum((preds != c) & (targets == c)))
+            c_total = int(np.sum(targets == c))
+
+            prec = float(tp / max(tp + fp, 1e-9)) if (tp + fp) > 0 else 0.0
+            rec = float(tp / max(tp + fn, 1e-9)) if (tp + fn) > 0 else 0.0
+            f1 = float(2.0 * prec * rec / max(prec + rec, 1e-9)) if (prec + rec) > 0 else 0.0
+            class_acc = float(tp / max(c_total, 1)) if c_total > 0 else 0.0
+
+            per_class_f1[c_name] = f1
+            per_class_accuracy[c_name] = class_acc
+            precisions.append(prec)
+            recalls.append(rec)
+            f1s.append(f1)
+
+        macro_precision = float(np.mean(precisions)) if precisions else 0.0
+        macro_recall = float(np.mean(recalls)) if recalls else 0.0
+        macro_f1 = float(np.mean(f1s)) if f1s else 0.0
+
+        res = {
             "accuracy": acc,
-            "precision": prec,
-            "recall": rec,
-            "f1_score": f1,
-            "tp": tp,
-            "fp": fp,
-            "fn": fn,
-            "tn": tn,
+            "macro_precision": macro_precision,
+            "macro_recall": macro_recall,
+            "macro_f1": macro_f1,
+            "per_class_f1": per_class_f1,
+            "per_class_accuracy": per_class_accuracy,
             "total_samples": total,
         }
+
+        # Retrocompatibilidade com métricas escalares
+        cat_idx = 3 if num_classes == 10 else 1
+        if cat_idx < num_classes:
+            res["precision"] = precisions[cat_idx]
+            res["recall"] = recalls[cat_idx]
+            res["f1_score"] = f1s[cat_idx]
+            res["tp"] = int(np.sum((preds == cat_idx) & (targets == cat_idx)))
+            res["fp"] = int(np.sum((preds == cat_idx) & (targets != cat_idx)))
+            res["fn"] = int(np.sum((preds != cat_idx) & (targets == cat_idx)))
+            res["tn"] = int(np.sum((preds != cat_idx) & (targets != cat_idx)))
+        else:
+            res["precision"] = macro_precision
+            res["recall"] = macro_recall
+            res["f1_score"] = macro_f1
+            res["tp"] = int(np.sum(preds == targets))
+            res["fp"] = 0
+            res["fn"] = int(np.sum(preds != targets))
+            res["tn"] = 0
+
+        return res
 
     metrics_f = calc_metrics(all_f_preds, all_targets)
     metrics_f["mean_sparsity"] = float(np.mean(total_sparsity_f))
@@ -372,8 +428,9 @@ def export_weights_h(
     w3 = p3["w_q"].numpy().astype(np.int8)  # [32, 32, 3, 3]
     b3 = p3["b_q"].numpy().astype(np.int32) # [32]
 
-    w4 = p4["w_q"].numpy().astype(np.int8)  # [2, 512]
-    b4 = p4["b_q"].numpy().astype(np.int32) # [2]
+    w4 = p4["w_q"].numpy().astype(np.int8)  # [num_classes, 512]
+    b4 = p4["b_q"].numpy().astype(np.int32) # [num_classes]
+    num_classes = config.get("num_classes", w4.shape[0])
 
     def format_array_int8(arr: np.ndarray, indent: int = 4, items_per_line: int = 16) -> str:
         flat = arr.flatten()
@@ -411,7 +468,7 @@ def export_weights_h(
  *  - Camada 1: Conv2d(3, 16, 3x3) + BN (Fundidos) -> MaxPool2d(2) -> Leaky LIF (16x16x16)
  *  - Camada 2: Conv2d(16, 32, 3x3) + BN (Fundidos) -> MaxPool2d(2) -> Leaky LIF (32x8x8)
  *  - Camada 3: Conv2d(32, 32, 3x3) + BN (Fundidos) -> MaxPool2d(2) -> Leaky LIF (32x4x4)
- *  - Camada 4: Linear(512, 2) -> Leaky LIF (2)
+ *  - Camada 4: Linear(512, {num_classes}) -> Leaky LIF ({num_classes})
  *
  * Memória Flash/ROM ocupada:
  *  - Pesos Int8:   {total_weight_bytes:6d} bytes (~{total_weight_bytes / 1024.0:.2f} KB)
@@ -445,7 +502,7 @@ extern "C" {{
 #define SPIKEVISION_IN_CHANNELS        {config.get('in_channels', 3)}
 #define SPIKEVISION_INPUT_HEIGHT       32
 #define SPIKEVISION_INPUT_WIDTH        32
-#define SPIKEVISION_NUM_CLASSES        2
+#define SPIKEVISION_NUM_CLASSES        {num_classes}
 
 /* Constantes de Ponto Fixo do Decaimento Leaky LIF (beta = 0.900) */
 #define SPIKEVISION_BETA_NUM           {BETA_NUM}
@@ -481,7 +538,7 @@ extern "C" {{
 #define POOL3_OUT_W                    4
 
 #define FC_IN_FEATURES                 512
-#define FC_OUT_FEATURES                2
+#define FC_OUT_FEATURES                {num_classes}
 
 /* =========================================================================
  * Pesos e Biases Quantizados (Int8 / Int32)
@@ -518,12 +575,12 @@ SPIKEVISION_ALIGN16 static const int32_t conv3_bias[CONV3_OUT_CHANNELS] = {{
 {format_array_int32(b3)}
 }};
 
-/* Camada 4: Pesos [2][512] = 1.024 bytes */
+/* Camada 4: Pesos [{num_classes}][512] = {w4.nbytes} bytes */
 SPIKEVISION_ALIGN16 static const int8_t fc_weights[FC_OUT_FEATURES * FC_IN_FEATURES] = {{
 {format_array_int8(w4)}
 }};
 
-/* Camada 4: Biases [2] = 8 bytes */
+/* Camada 4: Biases [{num_classes}] = {b4.nbytes} bytes */
 SPIKEVISION_ALIGN16 static const int32_t fc_bias[FC_OUT_FEATURES] = {{
 {format_array_int32(b4)}
 }};
@@ -542,33 +599,32 @@ def export_test_samples_h(
     test_loader: torch.utils.data.DataLoader,
     int8_sim: BitAccurateInt8CSNN,
     output_path: str,
-    samples_per_class: int = 5,
+    samples_per_class: int = 1,
 ):
     """
-    Exporta amostras reais de teste (gatos e não-gatos) para validação bit-a-bit no firmware.
+    Exporta amostras reais de teste cobrindo todas as classes para validação bit-a-bit no firmware.
     """
     os.makedirs(os.path.dirname(output_path), exist_ok=True)
 
-    cat_samples = []
-    non_cat_samples = []
+    num_classes = int8_sim.num_classes
+    class_names = CIFAR10_CLASS_NAMES if num_classes == 10 else ["non-cat", "cat"]
+
+    samples_by_class: Dict[int, List[Tuple[torch.Tensor, int]]] = {c: [] for c in range(num_classes)}
+    needed = num_classes * samples_per_class
 
     for imgs, targets in test_loader:
         for i in range(imgs.size(0)):
             target = int(targets[i].item())
-            img = imgs[i]
-            if target == 1 and len(cat_samples) < samples_per_class:
-                cat_samples.append((img, target))
-            elif target == 0 and len(non_cat_samples) < samples_per_class:
-                non_cat_samples.append((img, target))
-
-            if len(cat_samples) >= samples_per_class and len(non_cat_samples) >= samples_per_class:
-                break
-        if len(cat_samples) >= samples_per_class and len(non_cat_samples) >= samples_per_class:
+            if target in samples_by_class and len(samples_by_class[target]) < samples_per_class:
+                samples_by_class[target].append((imgs[i], target))
+        if sum(len(v) for v in samples_by_class.values()) >= needed:
             break
 
-    all_samples = cat_samples + non_cat_samples
-    total_samples = len(all_samples)
+    all_samples = []
+    for c in range(num_classes):
+        all_samples.extend(samples_by_class[c])
 
+    total_samples = len(all_samples)
     sample_declarations = []
     test_cases_entries = []
 
@@ -578,7 +634,8 @@ def export_test_samples_h(
         pred, spk_counts, final_mem = int8_sim.forward_single(img)
 
         sample_name = f"test_sample_{idx}"
-        class_desc = "Gato (Cat)" if target == 1 else "Nao-Gato (Non-Cat)"
+        c_name = class_names[target] if target < len(class_names) else f"class_{target}"
+        pred_name = class_names[pred] if pred < len(class_names) else f"class_{pred}"
 
         # Formata o array C
         flat = img_q.flatten()
@@ -590,19 +647,22 @@ def export_test_samples_h(
             lines[-1] = lines[-1].rstrip(",")
         array_body = "\n".join(lines)
 
-        decl = f"""/* Amostra {idx}: {class_desc} | Ground-Truth: {target} | Pred Int8: {pred} | Spikes: [{spk_counts[0]}, {spk_counts[1]}] */
+        spk_str = ", ".join(str(s) for s in spk_counts)
+        mem_str = ", ".join(str(m) for m in final_mem)
+
+        decl = f"""/* Amostra {idx}: {c_name} (Label {target}) | Pred Int8: {pred_name} (Label {pred}) | Spikes: [{spk_str}] */
 static const uint8_t {sample_name}[3 * 32 * 32] = {{
 {array_body}
 }};"""
         sample_declarations.append(decl)
 
         entry = f"""    {{
-        "{class_desc}",
+        "{c_name}",
         {sample_name},
         {target},
         {pred},
-        {{{spk_counts[0]}, {spk_counts[1]}}},
-        {{{final_mem[0]}, {final_mem[1]}}}
+        {{{spk_str}}},
+        {{{mem_str}}}
     }}"""
         test_cases_entries.append(entry)
 
@@ -613,7 +673,7 @@ static const uint8_t {sample_name}[3 * 32 * 32] = {{
  * SpikeVision-S3: Amostras Reais de Teste para Validação Bit-a-Bit no ESP32-S3.
  *
  * ARQUIVO GERADO AUTOMATICAMENTE POR training/quantize_export.py.
- * Contém {total_samples} amostras ({samples_per_class} Gatos e {samples_per_class} Não-Gatos)
+ * Contém {total_samples} amostras ({samples_per_class} por classe para {num_classes} classes)
  * extraídas do conjunto de teste do CIFAR-10, junto com os resultados exatos esperados
  * do simulador de inferência Int8 de ponto fixo.
  */
@@ -622,6 +682,7 @@ static const uint8_t {sample_name}[3 * 32 * 32] = {{
 
 #include <stdint.h>
 #include <stddef.h>
+#include "weights.h"
 
 #ifdef __cplusplus
 extern "C" {{
@@ -635,11 +696,11 @@ extern "C" {{
 
 typedef struct {{
     const char* description;
-    const uint8_t* image_data;   /* Tensor plano CHW com valores em [0, 127] */
-    int ground_truth;            /* 1 = Gato, 0 = Nao-Gato */
-    int expected_prediction;     /* Predicao esperada do motor Int8 */
-    int32_t expected_spikes[2];  /* Contagem de spikes: [Nao-Gato, Gato] */
-    int32_t expected_mem[2];     /* Potencial final de membrana no timestep 8: [Nao-Gato, Gato] */
+    const uint8_t* image_data;                                  /* Tensor plano CHW com valores em [0, 127] */
+    int ground_truth;                                           /* Label ground-truth */
+    int expected_prediction;                                    /* Predicao esperada do motor Int8 */
+    int32_t expected_spikes[SPIKEVISION_NUM_CLASSES];           /* Contagem de spikes por classe */
+    int32_t expected_mem[SPIKEVISION_NUM_CLASSES];              /* Potencial final de membrana no timestep 8 */
 }} SNNTestCase;
 
 /* Arrays de dados de imagem das amostras */
@@ -683,18 +744,20 @@ def analyze_memory_footprint(quant_params: Dict[str, Dict[str, Any]]) -> Dict[st
     )
     flash_bytes = w_bytes + b_bytes
 
+    num_classes = p4["b_q"].numel()
+
     # Estados dos neurônios (Membranas em int32_t)
     mem_l1_bytes = (16 * 16 * 16) * 4 # 16 KB
     mem_l2_bytes = (32 * 8 * 8) * 4   # 8 KB
     mem_l3_bytes = (32 * 4 * 4) * 4   # 2 KB
-    mem_l4_bytes = 2 * 4              # 8 bytes
+    mem_l4_bytes = num_classes * 4
     total_mem_bytes = mem_l1_bytes + mem_l2_bytes + mem_l3_bytes + mem_l4_bytes
 
     # Buffers de ativação/spikes intermediários (em uint8_t)
     spk_l1_bytes = (16 * 16 * 16) * 1 # 4 KB
     spk_l2_bytes = (32 * 8 * 8) * 1   # 2 KB
     spk_l3_bytes = (32 * 4 * 4) * 1   # 512 bytes
-    spk_l4_bytes = 2 * 1              # 2 bytes
+    spk_l4_bytes = num_classes * 1
     total_spk_bytes = spk_l1_bytes + spk_l2_bytes + spk_l3_bytes + spk_l4_bytes
 
     # Buffer de convolução estática da camada 1 (p1 pré-calculado)
@@ -790,10 +853,16 @@ def main():
     print(f"  • F1-Score: {trained_metrics.get('cat_f1', 0.0) * 100:.2f}%")
     print(f"  • Esparsidade: {trained_metrics.get('overall_sparsity', 0.0) * 100:.2f}%\n")
 
+    num_classes = config.get(
+        "num_classes",
+        10 if ("fc.weight" in ckpt.get("model_state_dict", {}) and ckpt["model_state_dict"]["fc.weight"].shape[0] == 10) else 2
+    )
+    config["num_classes"] = num_classes
+
     # 2. Inicializar Modelo PyTorch Float32
     model = SpikeVisionCSNN(
         in_channels=config.get("in_channels", 3),
-        num_classes=config.get("num_classes", 2),
+        num_classes=num_classes,
         beta=config.get("beta", 0.9),
         slope=config.get("slope", 25.0),
     ).to(device)
@@ -836,17 +905,27 @@ def main():
     # 5. Instanciar Simulador Bit-Accurate Int8
     int8_sim = BitAccurateInt8CSNN(quant_params, num_steps=config.get("num_steps", 8))
 
-    # 6. Carregar Dataset de Teste Balanceado
-    logger.info("Carregando 2.000 amostras do conjunto de teste do CIFAR-10...")
-    _, test_loader = get_dataloaders(
-        data_dir=args.data_dir,
-        batch_size=args.batch_size,
-        num_workers=2,
-        in_channels=config.get("in_channels", 3),
-        download=False,
-        seed=42,
-        smoke_test=False,
-    )
+    # 6. Carregar Dataset de Teste (Multi-classe ou Binário)
+    if num_classes == 10:
+        logger.info("Carregando amostras do conjunto de teste completo do CIFAR-10 (10 classes)...")
+        _, test_loader = get_cifar10_multiclass_dataloaders(
+            data_dir=args.data_dir,
+            batch_size=args.batch_size,
+            num_workers=2,
+            augment=False,
+            download=False,
+        )
+    else:
+        logger.info("Carregando 2.000 amostras do conjunto de teste binário do CIFAR-10...")
+        _, test_loader = get_cifar10_cat_dataloaders(
+            data_dir=args.data_dir,
+            batch_size=args.batch_size,
+            num_workers=2,
+            in_channels=config.get("in_channels", 3),
+            download=False,
+            seed=42,
+            smoke_test=False,
+        )
 
     # 7. Avaliação e Comparação Float32 vs Int8
     metrics_f, metrics_i, agreement = evaluate_comparison(
@@ -858,7 +937,7 @@ def main():
     )
 
     print("\n" + "=" * 70)
-    print("📈 RESULTADOS DA VALIDAÇÃO (2.000 Amostras do Conjunto de Teste)")
+    print(f"📈 RESULTADOS DA VALIDAÇÃO ({len(test_loader.dataset):,} Amostras do Conjunto de Teste - {num_classes} Classes)")
     print("=" * 70)
     print(f"{'Métrica':<25} | {'Float32 Original':<20} | {'Int8 Quantizado':<20} | {'Diferença':<12}")
     print("-" * 70)
@@ -868,15 +947,17 @@ def main():
     prec_diff = (metrics_i["precision"] - metrics_f["precision"]) * 100.0
     sp_diff = (metrics_i["mean_sparsity"] - metrics_f["mean_sparsity"]) * 100.0
 
+    f1_label = "F1-Score (Macro)" if num_classes == 10 else "F1-Score (Gatos)"
+    prec_label = "Precisão (Macro)" if num_classes == 10 else "Precisão (Gatos)"
+    rec_label = "Recall (Macro)" if num_classes == 10 else "Recall (Gatos)"
+
     print(f"{'Acurácia Total':<25} | {metrics_f['accuracy']*100:6.2f}%              | {metrics_i['accuracy']*100:6.2f}%              | {acc_diff:+6.2f}%")
-    print(f"{'F1-Score (Gatos)':<25} | {metrics_f['f1_score']*100:6.2f}%              | {metrics_i['f1_score']*100:6.2f}%              | {f1_diff:+6.2f}%")
-    print(f"{'Precisão (Gatos)':<25} | {metrics_f['precision']*100:6.2f}%              | {metrics_i['precision']*100:6.2f}%              | {prec_diff:+6.2f}%")
-    print(f"{'Recall (Gatos)':<25} | {metrics_f['recall']*100:6.2f}%              | {metrics_i['recall']*100:6.2f}%              | {rec_diff:+6.2f}%")
+    print(f"{f1_label:<25} | {metrics_f['f1_score']*100:6.2f}%              | {metrics_i['f1_score']*100:6.2f}%              | {f1_diff:+6.2f}%")
+    print(f"{prec_label:<25} | {metrics_f['precision']*100:6.2f}%              | {metrics_i['precision']*100:6.2f}%              | {prec_diff:+6.2f}%")
+    print(f"{rec_label:<25} | {metrics_f['recall']*100:6.2f}%              | {metrics_i['recall']*100:6.2f}%              | {rec_diff:+6.2f}%")
     print(f"{'Esparsidade Média':<25} | {metrics_f['mean_sparsity']*100:6.2f}%              | {metrics_i['mean_sparsity']*100:6.2f}%              | {sp_diff:+6.2f}%")
     print(f"{'Concordância (Agreement)':<25} | {'100.00%':<20} | {agreement*100:6.2f}%              | -")
     print("-" * 70)
-    print(f"Matriz de Confusão Int8:  TP={metrics_i['tp']} | FP={metrics_i['fp']} | FN={metrics_i['fn']} | TN={metrics_i['tn']}")
-    print(f"Matriz de Confusão Float: TP={metrics_f['tp']} | FP={metrics_f['fp']} | FN={metrics_f['fn']} | TN={metrics_f['tn']}\n")
 
     # 8. Análise de Memória no ESP32-S3
     mem_analysis = analyze_memory_footprint(quant_params)
@@ -887,7 +968,8 @@ def main():
 
     # 9. Exportar Cabeçalhos C/C++
     export_weights_h(quant_params, args.output_weights, config)
-    export_test_samples_h(test_loader, int8_sim, args.output_samples, samples_per_class=args.test_samples_per_class)
+    samples_per_cls = 1 if num_classes == 10 else args.test_samples_per_class
+    export_test_samples_h(test_loader, int8_sim, args.output_samples, samples_per_class=samples_per_cls)
 
     # 10. Salvar Relatório em JSON
     report = {

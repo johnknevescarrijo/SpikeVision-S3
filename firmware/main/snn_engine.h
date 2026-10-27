@@ -13,9 +13,9 @@ extern "C" {
  * Estrutura contendo o resultado completo e as métricas de inferência da CSNN.
  */
 typedef struct {
-    int predicted_class;          /**< 0 = Nao-Gato (Non-Cat), 1 = Gato (Cat) */
-    int32_t spike_counts[2];      /**< Spikes acumulados na saída: [non_cat, cat] */
-    int32_t final_mem[2];         /**< Potencial final de membrana no timestep T: [non_cat, cat] */
+    int predicted_class;                                  /**< Indice da classe predita [0 .. SPIKEVISION_NUM_CLASSES-1] */
+    int32_t spike_counts[SPIKEVISION_NUM_CLASSES];        /**< Spikes acumulados por classe na saida */
+    int32_t final_mem[SPIKEVISION_NUM_CLASSES];           /**< Potencial final de membrana no timestep T por classe */
 
     /* Métricas neuromórficas de disparo e esparsidade */
     uint32_t total_spikes_l1;     /**< Spikes totais disparados na Camada 1 */
