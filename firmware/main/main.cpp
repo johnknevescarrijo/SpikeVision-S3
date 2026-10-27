@@ -61,11 +61,26 @@ static void print_system_info(void) {
     printf("  • Ocupação ROM Pesos:   15608 bytes (15.24 KB)\n\n");
 }
 
+static const char* get_class_name(int cls) {
+#if (SPIKEVISION_NUM_CLASSES == 10)
+    static const char* const kClassNames[10] = {
+        "airplane", "automobile", "bird", "cat", "deer",
+        "dog", "frog", "horse", "ship", "truck"
+    };
+    if (cls >= 0 && cls < 10) return kClassNames[cls];
+    return "unknown";
+#else
+    if (cls == 1) return "CAT";
+    return "NON-CAT";
+#endif
+}
+
 static int run_validation_suite(void) {
-    printf("🚀 [Executando Bateria de Testes nas 10 Amostras do CIFAR-10]...\n");
-    printf("------------------------------------------------------------------------------------------------------------------------------------\n");
-    printf("| ID | Ground-Truth | Pred SNN | Spikes [N, C] | Membrana Final   | Esparsidade | SOPs Ativas | Latência  | Ciclos CPU | Status       |\n");
-    printf("------------------------------------------------------------------------------------------------------------------------------------\n");
+    printf("🚀 [Executando Bateria de Testes nas %d Amostras do CIFAR-10 (%d Classes)]...\n",
+           TEST_SAMPLE_COUNT, SPIKEVISION_NUM_CLASSES);
+    printf("--------------------------------------------------------------------------------------------------------------------\n");
+    printf("| ID | Ground-Truth | Pred SNN     | Top Spikes | Top Mem  | Sparsity | SOPs Ativas | Latência  | Match PyTorch  |\n");
+    printf("--------------------------------------------------------------------------------------------------------------------\n");
 
     int bit_accurate_matches = 0;
     int correct_predictions = 0;
@@ -80,10 +95,16 @@ static int run_validation_suite(void) {
 
         snn_engine_infer(tc->image_data, &result);
 
-        bool spk_match = (result.spike_counts[0] == tc->expected_spikes[0] &&
-                          result.spike_counts[1] == tc->expected_spikes[1]);
-        bool mem_match = (result.final_mem[0] == tc->expected_mem[0] &&
-                          result.final_mem[1] == tc->expected_mem[1]);
+        bool spk_match = true;
+        bool mem_match = true;
+        for (int c = 0; c < SPIKEVISION_NUM_CLASSES; ++c) {
+            if (result.spike_counts[c] != tc->expected_spikes[c]) {
+                spk_match = false;
+            }
+            if (result.final_mem[c] != tc->expected_mem[c]) {
+                mem_match = false;
+            }
+        }
         bool pred_match = (result.predicted_class == tc->expected_prediction);
         bool bit_accurate = spk_match && mem_match && pred_match;
 
@@ -95,23 +116,25 @@ static int run_validation_suite(void) {
         total_dense_macs += result.dense_macs;
         total_sparsity += result.sparsity_percent;
 
-        const char* gt_str = (tc->ground_truth == 1) ? "GATO    " : "NAO-GATO";
-        const char* pred_str = (result.predicted_class == 1) ? "GATO    " : "NAO-GATO";
+        const char* gt_str = get_class_name(tc->ground_truth);
+        const char* pred_str = get_class_name(result.predicted_class);
         const char* status_str = bit_accurate ? "\033[32mPASS (BIT-ACC)\033[0m" : "\033[31mFAIL          \033[0m";
 
-        printf("| %02d | %s     | %s |   [%" PRId32 ", %" PRId32 "]     | [%6" PRId32 ", %6" PRId32 "] |   %5.1f%%    | %10" PRIu64 "  | %7.2f ms | %10" PRIu32 " | %s |\n",
+        int32_t top_spk = result.spike_counts[result.predicted_class];
+        int32_t top_mem = result.final_mem[result.predicted_class];
+
+        printf("| %02d | %-12s | %-12s |    %4" PRId32 "    |  %7" PRId32 " |  %5.1f%%  | %10" PRIu64 "  | %7.2f ms | %-14s |\n",
                i,
                gt_str,
                pred_str,
-               result.spike_counts[0], result.spike_counts[1],
-               result.final_mem[0], result.final_mem[1],
+               top_spk,
+               top_mem,
                result.sparsity_percent,
                result.active_sops,
                (float)result.latency_us / 1000.0f,
-               result.cpu_cycles,
                status_str);
     }
-    printf("------------------------------------------------------------------------------------------------------------------------------------\n\n");
+    printf("--------------------------------------------------------------------------------------------------------------------\n\n");
 
     /* Relatório Consolidado */
     float avg_latency_ms = ((float)total_latency_us / (float)TEST_SAMPLE_COUNT) / 1000.0f;
@@ -131,11 +154,12 @@ static int run_validation_suite(void) {
     printf("  • Operações Sinápticas (SOPs):     %.0f SOPs (Média por Inferência)\n", avg_sops);
     printf("  • Operações Dense MAC Equivalente: %.0f MACs\n", avg_dense_macs);
     printf("  • Redução de Carga Computacional:  %.2f%% de Economia de Hardware!\n", reduction_percent);
-    printf("  • Memória Flash Necessária:        ~15.24 KB\n");
-    printf("  • Memória SRAM Interna Necessária: ~162.50 KB (100%% alocação estática)\n\n");
+    printf("  • Memória SRAM Interna Motor:      %zu bytes (%.2f KB) [100%% Estática]\n\n",
+           snn_engine_get_sram_usage(), (float)snn_engine_get_sram_usage() / 1024.0f);
 
     if (bit_accurate_matches == TEST_SAMPLE_COUNT) {
-        printf("\033[32m✔ SUCESSO ABSOLUTO: Todas as 10 amostras apresentaram 100%% de paridade bit-a-bit!\033[0m\n\n");
+        printf("\033[32m✔ SUCESSO ABSOLUTO: Todas as %d amostras apresentaram 100%% de paridade bit-a-bit!\033[0m\n\n",
+               TEST_SAMPLE_COUNT);
         return 0;
     } else {
         printf("\033[31m✘ FALHA: Divergência detectada em %d amostras.\033[0m\n\n",
