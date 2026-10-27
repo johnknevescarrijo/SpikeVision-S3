@@ -67,7 +67,7 @@ CONFIG = {
     "slope": 25.0,           # Inclinação do gradiente substituto FastSigmoid
     "encoding": "direct",    # 'direct' (recomendado, alta acurácia) ou 'rate'
     "in_channels": 3,        # 3 para RGB (ou 1 para escala de cinza)
-    "num_classes": 2,        # Binário: 0 (Não-Gato) vs 1 (Gato)
+    "num_classes": 10,       # 10 classes completas do CIFAR-10
 
     # Sistema e Reprodutibilidade
     "seed": 42,
@@ -93,9 +93,22 @@ def set_seed(seed: int = 42):
 
 
 # ==============================================================================
-# DATASET: CIFAR-10 BINÁRIO BALANCEADO (GATO vs NÃO-GATO)
+# DATASET: CIFAR-10 COMPLETO (10 CLASSES)
 # ==============================================================================
 CIFAR10_CAT_LABEL = 3
+
+CIFAR10_CLASS_NAMES = [
+    "airplane",
+    "automobile",
+    "bird",
+    "cat",
+    "deer",
+    "dog",
+    "frog",
+    "horse",
+    "ship",
+    "truck",
+]
 
 
 class BinaryCatCIFAR10(Dataset):
@@ -229,24 +242,40 @@ def get_dataloaders(
     num_workers: int = 2,
     in_channels: int = 3,
     seed: int = 42,
+    augment: bool = True,
 ) -> Tuple[DataLoader, DataLoader]:
-    """Cria os DataLoaders balanceados para treino e teste."""
+    """Cria os DataLoaders para treino e teste do CIFAR-10 completo (10 classes)."""
     os.makedirs(data_dir, exist_ok=True)
 
-    train_dataset = BinaryCatCIFAR10(
+    train_transforms_list = []
+    if augment:
+        train_transforms_list.extend([
+            transforms.RandomCrop(32, padding=4, padding_mode="reflect"),
+            transforms.RandomHorizontalFlip(),
+        ])
+    if in_channels == 1:
+        train_transforms_list.append(transforms.Grayscale(num_output_channels=1))
+    train_transforms_list.append(transforms.ToTensor())
+    train_transform = transforms.Compose(train_transforms_list)
+
+    test_transforms_list = []
+    if in_channels == 1:
+        test_transforms_list.append(transforms.Grayscale(num_output_channels=1))
+    test_transforms_list.append(transforms.ToTensor())
+    test_transform = transforms.Compose(test_transforms_list)
+
+    train_dataset = torchvision.datasets.CIFAR10(
         root=data_dir,
         train=True,
-        in_channels=in_channels,
         download=True,
-        seed=seed,
+        transform=train_transform,
     )
 
-    test_dataset = BinaryCatCIFAR10(
+    test_dataset = torchvision.datasets.CIFAR10(
         root=data_dir,
         train=False,
-        in_channels=in_channels,
         download=True,
-        seed=seed,
+        transform=test_transform,
     )
 
     train_loader = DataLoader(
@@ -275,14 +304,14 @@ def get_dataloaders(
 # ==============================================================================
 class SpikeVisionCSNN(nn.Module):
     """
-    Convolutional Spiking Neural Network (CSNN) para classificação binária (Gato vs Não-Gato).
-    Arquitetura ultra-compacta (15.400 parâmetros / ~15.4 KB Int8) ideal para o ESP32-S3.
+    Convolutional Spiking Neural Network (CSNN) para classificação CIFAR-10 (10 classes).
+    Arquitetura ultra-compacta (~19.5 KB Int8) ideal para o ESP32-S3.
     """
 
     def __init__(
         self,
         in_channels: int = 3,
-        num_classes: int = 2,
+        num_classes: int = 10,
         beta: float = 0.9,
         slope: float = 25.0,
     ):
@@ -484,6 +513,83 @@ def train_one_epoch(
     return avg_loss, acc, avg_fr
 
 
+def compute_multiclass_metrics(
+    preds: torch.Tensor,
+    targets: torch.Tensor,
+    num_classes: int = 10,
+    class_names: Any = None,
+) -> Dict[str, Any]:
+    """
+    Calcula acurácia top-1, métricas macro (precisão, recall, f1)
+    e métricas por classe para classificação multi-classe.
+    """
+    if class_names is None:
+        if num_classes == 10:
+            class_names = CIFAR10_CLASS_NAMES
+        else:
+            class_names = [f"class_{i}" for i in range(num_classes)]
+
+    if isinstance(preds, torch.Tensor):
+        preds_np = preds.detach().cpu().numpy()
+    else:
+        preds_np = np.asarray(preds)
+
+    if isinstance(targets, torch.Tensor):
+        targets_np = targets.detach().cpu().numpy()
+    else:
+        targets_np = np.asarray(targets)
+
+    total_samples = len(targets_np)
+    correct = int((preds_np == targets_np).sum())
+    accuracy = correct / max(total_samples, 1)
+
+    per_class_f1 = {}
+    per_class_accuracy = {}
+    precisions = []
+    recalls = []
+    f1s = []
+
+    for c in range(num_classes):
+        c_name = class_names[c] if c < len(class_names) else f"class_{c}"
+        tp = int(((preds_np == c) & (targets_np == c)).sum())
+        fp = int(((preds_np == c) & (targets_np != c)).sum())
+        fn = int(((preds_np != c) & (targets_np == c)).sum())
+        class_total = int((targets_np == c).sum())
+
+        prec = tp / max(tp + fp, 1e-9) if (tp + fp) > 0 else 0.0
+        rec = tp / max(tp + fn, 1e-9) if (tp + fn) > 0 else 0.0
+        f1 = 2.0 * (prec * rec) / max(prec + rec, 1e-9) if (prec + rec) > 0 else 0.0
+        class_acc = tp / max(class_total, 1) if class_total > 0 else 0.0
+
+        per_class_f1[c_name] = float(f1)
+        per_class_accuracy[c_name] = float(class_acc)
+        precisions.append(prec)
+        recalls.append(rec)
+        f1s.append(f1)
+
+    macro_precision = float(np.mean(precisions)) if precisions else 0.0
+    macro_recall = float(np.mean(recalls)) if recalls else 0.0
+    macro_f1 = float(np.mean(f1s)) if f1s else 0.0
+
+    metrics: Dict[str, Any] = {
+        "accuracy": float(accuracy),
+        "macro_precision": macro_precision,
+        "macro_recall": macro_recall,
+        "macro_f1": macro_f1,
+        "per_class_f1": per_class_f1,
+        "per_class_accuracy": per_class_accuracy,
+    }
+
+    # Compatibilidade retroativa para binário / chave gato
+    cat_idx = 3 if num_classes == 10 else 1
+    if cat_idx < num_classes:
+        metrics["cat_precision"] = float(precisions[cat_idx])
+        metrics["cat_recall"] = float(recalls[cat_idx])
+        metrics["cat_f1"] = float(f1s[cat_idx])
+
+    return metrics
+
+
 def evaluate(
     model: nn.Module,
     data_loader: DataLoader,
@@ -491,18 +597,18 @@ def evaluate(
     device: torch.device,
     num_steps: int,
     encoding: str,
-) -> Dict[str, float]:
-    """Avalia o modelo calculando Acurácia, F1-Score e Esparsidade."""
+    num_classes: Optional[int] = None,
+) -> Dict[str, Any]:
+    """Avalia o modelo calculando Acurácia, Macro-F1, Precisão, Recall e Esparsidade."""
     model.eval()
     total_loss = 0.0
     total_samples = 0
-    correct = 0
 
-    tp = 0
-    fp = 0
-    fn = 0
-    tn = 0
+    if num_classes is None:
+        num_classes = getattr(model, "num_classes", 10)
 
+    all_preds = []
+    all_targets = []
     overall_fr_list = []
     overall_sp_list = []
 
@@ -525,42 +631,34 @@ def evaluate(
             if no_spike_mask.any():
                 preds[no_spike_mask] = mem_out[-1, no_spike_mask].argmax(dim=1)
 
-            correct += (preds == targets).sum().item()
+            all_preds.append(preds.cpu())
+            all_targets.append(targets.cpu())
             total_samples += targets.size(0)
-
-            for p, t in zip(preds.cpu().numpy(), targets.cpu().numpy()):
-                if t == 1 and p == 1:
-                    tp += 1
-                elif t == 0 and p == 1:
-                    fp += 1
-                elif t == 1 and p == 0:
-                    fn += 1
-                elif t == 0 and p == 0:
-                    tn += 1
 
             overall_fr_list.append(sparsity_dict["overall_firing_rate"])
             overall_sp_list.append(sparsity_dict["overall_sparsity"])
 
     avg_loss = total_loss / max(total_samples, 1)
-    acc = correct / max(total_samples, 1)
 
-    precision = tp / max(tp + fp, 1e-9)
-    recall = tp / max(tp + fn, 1e-9)
-    f1 = 2 * (precision * recall) / max(precision + recall, 1e-9)
+    if all_preds:
+        cat_preds = torch.cat(all_preds, dim=0)
+        cat_targets = torch.cat(all_targets, dim=0)
+        metrics = compute_multiclass_metrics(cat_preds, cat_targets, num_classes=num_classes)
+    else:
+        metrics = {
+            "accuracy": 0.0,
+            "macro_precision": 0.0,
+            "macro_recall": 0.0,
+            "macro_f1": 0.0,
+            "per_class_f1": {},
+            "per_class_accuracy": {},
+        }
 
-    return {
-        "loss": avg_loss,
-        "accuracy": acc,
-        "cat_precision": precision,
-        "cat_recall": recall,
-        "cat_f1": f1,
-        "tp": tp,
-        "fp": fp,
-        "fn": fn,
-        "tn": tn,
-        "overall_firing_rate": float(np.mean(overall_fr_list)) if overall_fr_list else 0.0,
-        "overall_sparsity": float(np.mean(overall_sp_list)) if overall_sp_list else 0.0,
-    }
+    metrics["loss"] = avg_loss
+    metrics["total_samples"] = total_samples
+    metrics["overall_firing_rate"] = float(np.mean(overall_fr_list)) if overall_fr_list else 0.0
+    metrics["overall_sparsity"] = float(np.mean(overall_sp_list)) if overall_sp_list else 0.0
+    return metrics
 
 
 # ==============================================================================
@@ -572,7 +670,7 @@ def main():
     # 1. Detecção do Dispositivo
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print("=" * 72)
-    print("🚀 SpikeVision-S3: Treinamento CSNN no Google Colab")
+    print("🚀 SpikeVision-S3: Treinamento CSNN no Google Colab (10 Classes CIFAR-10)")
     print("=" * 72)
     print(f"Dispositivo de execução: {device}")
     if torch.cuda.is_available():
@@ -585,13 +683,14 @@ def main():
     print("=" * 72)
 
     # 2. Carregar Dados
-    print(f"\nCarregando CIFAR-10 balanceado (Batch Size: {CONFIG['batch_size']}, Workers: {CONFIG['num_workers']})...")
+    print(f"\nCarregando CIFAR-10 completo (10 classes, Batch Size: {CONFIG['batch_size']}, Workers: {CONFIG['num_workers']})...")
     train_loader, test_loader = get_dataloaders(
         data_dir=CONFIG["data_dir"],
         batch_size=CONFIG["batch_size"],
         num_workers=CONFIG["num_workers"],
         in_channels=CONFIG["in_channels"],
         seed=CONFIG["seed"],
+        augment=True,
     )
     print(f"✓ Amostras de Treino: {len(train_loader.dataset):,} | Amostras de Teste: {len(test_loader.dataset):,}")
 
@@ -615,7 +714,7 @@ def main():
     history = []
 
     print("\nIniciando treinamento SNN:")
-    print(f"Épocas: {CONFIG['epochs']} | Timesteps (T): {CONFIG['num_steps']} | Codificação: {CONFIG['encoding']} | Beta LIF: {CONFIG['beta']}\n")
+    print(f"Épocas: {CONFIG['epochs']} | Classes: {CONFIG['num_classes']} | Timesteps (T): {CONFIG['num_steps']} | Codificação: {CONFIG['encoding']} | Beta LIF: {CONFIG['beta']}\n")
 
     start_total_time = time.time()
 
@@ -639,6 +738,7 @@ def main():
             device=device,
             num_steps=CONFIG["num_steps"],
             encoding=CONFIG["encoding"],
+            num_classes=CONFIG["num_classes"],
         )
 
         scheduler.step()
@@ -646,9 +746,9 @@ def main():
 
         test_acc = test_metrics["accuracy"]
         test_loss = test_metrics["loss"]
-        f1 = test_metrics["cat_f1"]
-        precision = test_metrics["cat_precision"]
-        recall = test_metrics["cat_recall"]
+        macro_f1 = test_metrics.get("macro_f1", 0.0)
+        macro_p = test_metrics.get("macro_precision", 0.0)
+        macro_r = test_metrics.get("macro_recall", 0.0)
         overall_fr = test_metrics["overall_firing_rate"]
         sparsity = test_metrics["overall_sparsity"]
 
@@ -656,7 +756,7 @@ def main():
             f"Época [{epoch:02d}/{CONFIG['epochs']:02d}] ({epoch_time:4.1f}s) | "
             f"Treino Loss: {train_loss:.4f} Acc: {train_acc*100:5.2f}% | "
             f"Teste Loss: {test_loss:.4f} Acc: {test_acc*100:5.2f}% | "
-            f"Gato F1: {f1:.3f} (P: {precision:.2f}, R: {recall:.2f}) | "
+            f"Macro-F1: {macro_f1:.3f} (P: {macro_p:.2f}, R: {macro_r:.2f}) | "
             f"Esparsidade: {sparsity*100:5.1f}%"
         )
 
@@ -667,9 +767,11 @@ def main():
             "train_firing_rate": train_fr,
             "test_loss": test_loss,
             "test_acc": test_acc,
-            "test_cat_f1": f1,
-            "test_cat_precision": precision,
-            "test_cat_recall": recall,
+            "test_macro_f1": macro_f1,
+            "test_macro_precision": macro_p,
+            "test_macro_recall": macro_r,
+            "test_per_class_f1": test_metrics.get("per_class_f1", {}),
+            "test_per_class_accuracy": test_metrics.get("per_class_accuracy", {}),
             "test_sparsity": sparsity,
             "epoch_time_sec": epoch_time,
         }
