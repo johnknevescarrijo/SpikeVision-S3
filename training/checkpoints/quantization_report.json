@@ -1,14 +1,14 @@
 {
   "model_architecture": "SpikeVisionCSNN",
   "training_checkpoint": "training/checkpoints/best_spikevision_csnn.pth",
-  "epoch": 24,
+  "epoch": 16,
   "config": {
     "in_channels": 3,
-    "num_classes": 2,
+    "num_classes": 10,
     "beta": 0.9,
     "slope": 25.0,
     "num_steps": 8,
-    "encoding": "direct"
+    "encoding": "rate"
   },
   "quantization_format": {
     "weights": "int8_t (symmetric per-layer)",
@@ -23,11 +23,11 @@
   },
   "layers": {
     "layer1": {
-      "w_max": 1.566417932510376,
-      "scale_weight": 81.07670205005059,
+      "w_max": 0.21327738463878632,
+      "scale_weight": 595.4686673183443,
       "scale_input": 127.0,
-      "scale_total": 10296.741160356425,
-      "vth_quantized": 10297,
+      "scale_total": 75624.52074942972,
+      "vth_quantized": 75625,
       "weight_shape": [
         16,
         3,
@@ -39,11 +39,11 @@
       ]
     },
     "layer2": {
-      "w_max": 0.384703665971756,
-      "scale_weight": 330.12422608243105,
+      "w_max": 0.5920332670211792,
+      "scale_weight": 214.51497250990923,
       "scale_input": 1.0,
-      "scale_total": 330.12422608243105,
-      "vth_quantized": 330,
+      "scale_total": 214.51497250990923,
+      "vth_quantized": 215,
       "weight_shape": [
         32,
         16,
@@ -55,11 +55,11 @@
       ]
     },
     "layer3": {
-      "w_max": 0.270126074552536,
-      "scale_weight": 470.1508368282313,
+      "w_max": 0.46657678484916687,
+      "scale_weight": 272.195283014469,
       "scale_input": 1.0,
-      "scale_total": 470.1508368282313,
-      "vth_quantized": 470,
+      "scale_total": 272.195283014469,
+      "vth_quantized": 272,
       "weight_shape": [
         32,
         32,
@@ -71,56 +71,110 @@
       ]
     },
     "layer4": {
-      "w_max": 0.15289415419101715,
-      "scale_weight": 830.6399984484267,
+      "w_max": 0.39277714490890503,
+      "scale_weight": 323.3385690744672,
       "scale_input": 1.0,
-      "scale_total": 830.6399984484267,
-      "vth_quantized": 831,
+      "scale_total": 323.3385690744672,
+      "vth_quantized": 323,
       "weight_shape": [
-        2,
+        10,
         512
       ],
       "bias_shape": [
-        2
+        10
       ]
     }
   },
   "metrics_float32": {
-    "accuracy": 0.775,
-    "precision": 0.7579737335834896,
-    "recall": 0.808,
-    "f1_score": 0.782187802516941,
-    "tp": 808,
-    "fp": 258,
-    "fn": 192,
-    "tn": 742,
-    "total_samples": 2000,
-    "mean_sparsity": 0.8003766193659179
+    "accuracy": 0.1857,
+    "macro_precision": 0.487975441193292,
+    "macro_recall": 0.18570000000000003,
+    "macro_f1": 0.11175707030616233,
+    "per_class_f1": {
+      "airplane": 0.3923593185338152,
+      "automobile": 0.019704433497536946,
+      "bird": 0.05802357207615594,
+      "cat": 0.23920887344647868,
+      "deer": 0.10508757297748124,
+      "dog": 0.0019980019980019984,
+      "frog": 0.001988071570576541,
+      "horse": 0.005982053838484547,
+      "ship": 0.28923076923076924,
+      "truck": 0.003988035892323031
+    },
+    "per_class_accuracy": {
+      "airplane": 0.38,
+      "automobile": 0.01,
+      "bird": 0.032,
+      "cat": 0.895,
+      "deer": 0.063,
+      "dog": 0.001,
+      "frog": 0.001,
+      "horse": 0.003,
+      "ship": 0.47,
+      "truck": 0.002
+    },
+    "total_samples": 10000,
+    "precision": 0.13805337035323154,
+    "recall": 0.895,
+    "f1_score": 0.23920887344647868,
+    "tp": 895,
+    "fp": 5588,
+    "fn": 105,
+    "tn": 3412,
+    "mean_sparsity": 0.9392601213992818
   },
   "metrics_int8": {
-    "accuracy": 0.7725,
-    "precision": 0.7413640389725421,
-    "recall": 0.837,
-    "f1_score": 0.7862846406763739,
-    "tp": 837,
-    "fp": 292,
-    "fn": 163,
-    "tn": 708,
-    "total_samples": 2000,
-    "mean_sparsity": 0.8006567503819418
+    "accuracy": 0.101,
+    "macro_precision": 0.13394017097750732,
+    "macro_recall": 0.101,
+    "macro_f1": 0.020526368490283144,
+    "per_class_f1": {
+      "airplane": 0.0,
+      "automobile": 0.0,
+      "bird": 0.0,
+      "cat": 0.1822331781247147,
+      "deer": 0.0019980019980019984,
+      "dog": 0.0,
+      "frog": 0.0,
+      "horse": 0.0,
+      "ship": 0.02103250478011472,
+      "truck": 0.0
+    },
+    "per_class_accuracy": {
+      "airplane": 0.0,
+      "automobile": 0.0,
+      "bird": 0.0,
+      "cat": 0.998,
+      "deer": 0.001,
+      "dog": 0.0,
+      "frog": 0.0,
+      "horse": 0.0,
+      "ship": 0.011,
+      "truck": 0.0
+    },
+    "total_samples": 10000,
+    "precision": 0.10027127499246459,
+    "recall": 0.998,
+    "f1_score": 0.1822331781247147,
+    "tp": 998,
+    "fp": 8955,
+    "fn": 2,
+    "tn": 45,
+    "mean_sparsity": 0.9832557698445004
   },
-  "agreement_rate": 0.9645,
+  "agreement_rate": 0.6486,
   "memory_analysis": {
-    "flash_weights_bytes": 15280,
-    "flash_bias_bytes": 328,
-    "total_flash_model_bytes": 15608,
-    "total_flash_model_kb": 15.2421875,
-    "sram_membrane_potentials_bytes": 26632,
-    "sram_spike_buffers_bytes": 6658,
+    "flash_weights_bytes": 19376,
+    "flash_bias_bytes": 360,
+    "total_flash_model_bytes": 19736,
+    "total_flash_model_kb": 19.2734375,
+    "sram_membrane_potentials_bytes": 26664,
+    "sram_spike_buffers_bytes": 6666,
     "sram_layer1_preconv_buffer_bytes": 16384,
-    "total_peak_sram_bytes": 49674,
-    "total_peak_sram_kb": 48.509765625,
+    "total_peak_sram_bytes": 49714,
+    "total_peak_sram_kb": 48.548828125,
     "esp32s3_sram_total_kb": 512.0,
-    "esp32s3_sram_utilization_percent": 9.474563598632812
+    "esp32s3_sram_utilization_percent": 9.482192993164062
   }
 }
