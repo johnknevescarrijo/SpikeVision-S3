@@ -56,8 +56,9 @@ static void print_system_info(void) {
     printf("  • Plataforma:           Linux Host x86_64 / Native C++\n");
     printf("  • Modo de Operação:     Validação Bit-a-Bit Cruzada\n");
 #endif
+    const size_t sram_bytes = snn_engine_get_sram_bytes();
     printf("  • Consumo SRAM Motor:   %zu bytes (%.2f KB) [100%% Estática, 0 Heap]\n",
-           snn_engine_get_sram_usage(), (float)snn_engine_get_sram_usage() / 1024.0f);
+           sram_bytes, (float)sram_bytes / 1024.0f);
     printf("  • Ocupação ROM Pesos:   15608 bytes (15.24 KB)\n\n");
 }
 
@@ -154,8 +155,9 @@ static int run_validation_suite(void) {
     printf("  • Operações Sinápticas (SOPs):     %.0f SOPs (Média por Inferência)\n", avg_sops);
     printf("  • Operações Dense MAC Equivalente: %.0f MACs\n", avg_dense_macs);
     printf("  • Redução de Carga Computacional:  %.2f%% de Economia de Hardware!\n", reduction_percent);
+    const size_t sram_bytes = snn_engine_get_sram_bytes();
     printf("  • Memória SRAM Interna Motor:      %zu bytes (%.2f KB) [100%% Estática]\n\n",
-           snn_engine_get_sram_usage(), (float)snn_engine_get_sram_usage() / 1024.0f);
+           sram_bytes, (float)sram_bytes / 1024.0f);
 
     if (bit_accurate_matches == TEST_SAMPLE_COUNT) {
         printf("\033[32m✔ SUCESSO ABSOLUTO: Todas as %d amostras apresentaram 100%% de paridade bit-a-bit!\033[0m\n\n",

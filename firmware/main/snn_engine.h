@@ -82,7 +82,12 @@ void snn_infer_adaptive(
     const snn_early_exit_cfg_t* early_exit_cfg);
 
 /**
- * Retorna o consumo total de memória estática (SRAM) alocada pelos buffers do motor.
+ * Retorna o consumo total de memória estática (SRAM) alocada pelos buffers do motor em bytes.
+ */
+size_t snn_engine_get_sram_bytes(void);
+
+/**
+ * Alias de compatibilidade para snn_engine_get_sram_bytes.
  */
 size_t snn_engine_get_sram_usage(void);
 
