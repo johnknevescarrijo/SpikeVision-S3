@@ -44,7 +44,7 @@ jobs:
         run: |
           python3 -m pip install --upgrade pip
           pip install --index-url https://download.pytorch.org/whl/cpu torch torchvision
-          pip install numpy snntorch pytest
+          pip install numpy snntorch tqdm pillow pytest
 
       - name: Run pytest suite
         run: pytest -v
