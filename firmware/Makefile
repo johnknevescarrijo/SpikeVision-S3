@@ -4,7 +4,7 @@ CXX ?= g++
 CXXFLAGS = -O3 -Wall -Wextra -pthread -std=c++17 -Iinclude -Itest_samples -Imain
 HOST_BIN = build_host/spikevision_s3_host
 
-SRCS = main/main.cpp main/snn_engine.cpp main/snn_pipeline.cpp main/image_preprocess.cpp main/camera_capture.cpp main/dvs_encoder.cpp
+SRCS = main/main.cpp main/snn_engine.cpp main/snn_pipeline.cpp main/image_preprocess.cpp main/camera_capture.cpp main/dvs_encoder.cpp main/serial_protocol.cpp
 
 .PHONY: all test host clean idf idf-build idf-flash idf-monitor
 

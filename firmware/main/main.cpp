@@ -9,11 +9,13 @@
 #include <stdint.h>
 #include <inttypes.h>
 #include <stdbool.h>
+#include <string.h>
 #include "snn_engine.h"
 #include "snn_pipeline.h"
 #include "image_preprocess.h"
 #include "camera_capture.h"
 #include "dvs_encoder.h"
+#include "serial_protocol.h"
 #include "test_samples.h"
 
 #if defined(ESP_PLATFORM)
@@ -619,8 +621,11 @@ extern "C" void app_main(void) {
 }
 #else
 int main(int argc, char** argv) {
-    (void)argc;
-    (void)argv;
+    if (argc > 1 && strcmp(argv[1], "--serial") == 0) {
+        snn_engine_init();
+        serial_protocol_run_stdio();
+        return 0;
+    }
     print_banner();
     print_system_info();
     snn_engine_init();

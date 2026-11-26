@@ -1,0 +1,583 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>SpikeVision-S3 · Neuromorphic Dashboard</title>
+  <style>
+    :root {
+      --bg: #0b0f17;
+      --panel: #131a26;
+      --panel-2: #192233;
+      --border: #263248;
+      --text: #e6edf7;
+      --muted: #8b9bb4;
+      --accent: #38bdf8;
+      --accent-2: #818cf8;
+      --ok: #34d399;
+      --warn: #fbbf24;
+      --danger: #f87171;
+    }
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      min-height: 100vh;
+      padding: 20px;
+    }
+    header {
+      max-width: 1200px;
+      margin: 0 auto 20px;
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      border-bottom: 1px solid var(--border);
+      padding-bottom: 14px;
+    }
+    .brand {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+    }
+    .brand-dot {
+      width: 12px;
+      height: 12px;
+      border-radius: 50%;
+      background: var(--ok);
+      box-shadow: 0 0 12px var(--ok);
+    }
+    h1 { font-size: 1.25rem; font-weight: 700; letter-spacing: -0.02em; }
+    .subtitle { font-size: 0.85rem; color: var(--muted); }
+    .pill-row { display: flex; gap: 8px; flex-wrap: wrap; }
+    .pill {
+      background: var(--panel);
+      border: 1px solid var(--border);
+      padding: 6px 10px;
+      border-radius: 999px;
+      font-size: 0.78rem;
+      color: var(--muted);
+    }
+    .pill strong { color: var(--text); }
+
+    main {
+      max-width: 1200px;
+      margin: 0 auto;
+      display: grid;
+      grid-template-columns: 380px 1fr;
+      gap: 20px;
+    }
+    @media (max-width: 900px) {
+      main { grid-template-columns: 1fr; }
+    }
+    .card {
+      background: var(--panel);
+      border: 1px solid var(--border);
+      border-radius: 14px;
+      padding: 18px;
+    }
+    .card-title {
+      font-size: 0.9rem;
+      font-weight: 600;
+      color: var(--muted);
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+      margin-bottom: 14px;
+    }
+    .canvas-wrap {
+      display: flex;
+      justify-content: center;
+      background: #06090e;
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 10px;
+      margin-bottom: 14px;
+    }
+    canvas#drawCanvas {
+      width: 320px;
+      height: 320px;
+      image-rendering: pixelated;
+      cursor: crosshair;
+      border-radius: 6px;
+      touch-action: none;
+    }
+    .controls-grid {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 10px;
+      margin-bottom: 12px;
+    }
+    label.field {
+      display: flex;
+      flex-direction: column;
+      gap: 5px;
+      font-size: 0.8rem;
+      color: var(--muted);
+    }
+    select, input[type="color"], input[type="range"] {
+      background: var(--panel-2);
+      border: 1px solid var(--border);
+      color: var(--text);
+      border-radius: 8px;
+      padding: 6px 8px;
+      font-size: 0.85rem;
+      width: 100%;
+    }
+    .toggle-row {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      background: var(--panel-2);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 8px 12px;
+      margin-bottom: 10px;
+      font-size: 0.85rem;
+    }
+    .btn-row {
+      display: flex;
+      gap: 8px;
+      flex-wrap: wrap;
+      margin-top: 10px;
+    }
+    button, .file-btn {
+      background: var(--panel-2);
+      border: 1px solid var(--border);
+      color: var(--text);
+      padding: 8px 12px;
+      border-radius: 8px;
+      font-size: 0.84rem;
+      font-weight: 600;
+      cursor: pointer;
+      transition: border-color 0.15s, background 0.15s;
+      text-align: center;
+    }
+    button:hover, .file-btn:hover { border-color: var(--accent); }
+    button.primary {
+      background: linear-gradient(135deg, var(--accent), var(--accent-2));
+      color: #06101d;
+      border: none;
+      flex: 1;
+    }
+    button.warn { border-color: #5c4316; color: var(--warn); }
+    .file-btn input { display: none; }
+
+    .metrics-grid {
+      display: grid;
+      grid-template-columns: repeat(4, 1fr);
+      gap: 12px;
+      margin-bottom: 18px;
+    }
+    @media (max-width: 700px) {
+      .metrics-grid { grid-template-columns: repeat(2, 1fr); }
+    }
+    .metric {
+      background: var(--panel-2);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 12px;
+    }
+    .metric-label { font-size: 0.75rem; color: var(--muted); margin-bottom: 4px; }
+    .metric-val { font-size: 1.3rem; font-weight: 700; font-variant-numeric: tabular-nums; }
+    .metric-val.highlight { color: var(--accent); }
+    .metric-sub { font-size: 0.75rem; color: var(--muted); margin-top: 2px; }
+
+    .dvs-strip {
+      display: none;
+      grid-template-columns: repeat(4, 1fr);
+      gap: 10px;
+      margin-bottom: 18px;
+      padding: 12px;
+      background: #111b2b;
+      border: 1px dashed var(--accent);
+      border-radius: 10px;
+    }
+    .dvs-strip.visible { display: grid; }
+
+    .bars { display: flex; flex-direction: column; gap: 8px; }
+    .bar-row {
+      display: grid;
+      grid-template-columns: 105px 1fr 48px;
+      align-items: center;
+      gap: 10px;
+      font-size: 0.84rem;
+    }
+    .bar-label { color: var(--muted); text-overflow: ellipsis; overflow: hidden; white-space: nowrap; }
+    .bar-row.winner .bar-label { color: var(--ok); font-weight: 700; }
+    .bar-track {
+      height: 12px;
+      background: #0a0f18;
+      border: 1px solid var(--border);
+      border-radius: 999px;
+      overflow: hidden;
+    }
+    .bar-fill {
+      height: 100%;
+      width: 0%;
+      background: linear-gradient(90deg, var(--accent), var(--accent-2));
+      transition: width 0.18s ease-out;
+    }
+    .bar-row.winner .bar-fill {
+      background: linear-gradient(90deg, #10b981, var(--ok));
+    }
+    .bar-num { text-align: right; font-variant-numeric: tabular-nums; color: var(--muted); }
+    .status-line {
+      margin-top: 14px;
+      font-size: 0.8rem;
+      color: var(--muted);
+      min-height: 1.2em;
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <div class="brand">
+      <div class="brand-dot" id="connDot"></div>
+      <div>
+        <h1>SpikeVision-S3 · Neuromorphic SNN</h1>
+        <div class="subtitle">Inferência Remota USB-CDC / Host Pipe · Zero-Malloc Int8</div>
+      </div>
+    </div>
+    <div class="pill-row">
+      <div class="pill">Backend: <strong id="infoSimd">—</strong></div>
+      <div class="pill">SRAM: <strong id="infoSram">—</strong></div>
+      <div class="pill">Timesteps: <strong id="infoT">—</strong></div>
+      <div class="pill">Proto: <strong id="infoVer">—</strong></div>
+    </div>
+  </header>
+
+  <main>
+    <section class="card">
+      <div class="card-title">Entrada Sensorial (32×32 RGB)</div>
+      <div class="canvas-wrap">
+        <canvas id="drawCanvas" width="32" height="32"></canvas>
+      </div>
+
+      <div class="controls-grid">
+        <label class="field">
+          Cor do Pincel
+          <input type="color" id="brushColor" value="#38bdf8" />
+        </label>
+        <label class="field">
+          Tamanho (<span id="brushSizeVal">2</span>px)
+          <input type="range" id="brushSize" min="1" max="5" value="2" />
+        </label>
+        <label class="field">
+          Preset Rápido
+          <select id="presetSelect">
+            <option value="">— Selecionar —</option>
+            <option value="cat">Silhueta Gato</option>
+            <option value="gradient">Gradiente RGB</option>
+            <option value="checker">Xadrez 4×4</option>
+            <option value="noise">Ruído Aleatório</option>
+          </select>
+        </label>
+        <label class="field">
+          Early-Exit Temporal
+          <select id="eeMode">
+            <option value="none">Desligado (Full T)</option>
+            <option value="lossless">Lossless (margin=0)</option>
+            <option value="aggressive">Agressivo (margin=2)</option>
+          </select>
+        </label>
+      </div>
+
+      <div class="toggle-row">
+        <span>Encoder Pseudo-DVS (ΔFrame)</span>
+        <input type="checkbox" id="useDvs" />
+      </div>
+      <div class="toggle-row">
+        <span>Inferência Automática ao Desenhar</span>
+        <input type="checkbox" id="autoInfer" checked />
+      </div>
+
+      <div class="btn-row">
+        <button class="primary" id="btnInfer">Inferir Agora</button>
+        <button id="btnClear">Limpar</button>
+        <button class="warn" id="btnResetDvs">Reset DVS</button>
+        <label class="file-btn">
+          Upload Img
+          <input type="file" id="imgUpload" accept="image/*" />
+        </label>
+      </div>
+    </section>
+
+    <section class="card">
+      <div class="card-title">Telemetria Neuromórfica em Tempo Real</div>
+      <div class="metrics-grid">
+        <div class="metric">
+          <div class="metric-label">Classe Predita</div>
+          <div class="metric-val highlight" id="mPred">—</div>
+          <div class="metric-sub" id="mPredIdx">índice —</div>
+        </div>
+        <div class="metric">
+          <div class="metric-label">Latência / FPS</div>
+          <div class="metric-val" id="mLat">—</div>
+          <div class="metric-sub" id="mFps">— FPS</div>
+        </div>
+        <div class="metric">
+          <div class="metric-label">SOPs Ativas</div>
+          <div class="metric-val" id="mSops">—</div>
+          <div class="metric-sub" id="mSparsity">Esparsidade —</div>
+        </div>
+        <div class="metric">
+          <div class="metric-label">Timesteps (t_exit)</div>
+          <div class="metric-val" id="mSteps">—</div>
+          <div class="metric-sub" id="mEeBadge">Full T</div>
+        </div>
+      </div>
+
+      <div class="dvs-strip" id="dvsStrip">
+        <div>
+          <div class="metric-label">DVS ON Events</div>
+          <div class="metric-val" id="mDvsOn">0</div>
+        </div>
+        <div>
+          <div class="metric-label">DVS OFF Events</div>
+          <div class="metric-val" id="mDvsOff">0</div>
+        </div>
+        <div>
+          <div class="metric-label">DVS Esparsidade</div>
+          <div class="metric-val" id="mDvsSp">100%</div>
+        </div>
+        <div>
+          <div class="metric-label">Estado da Cena</div>
+          <div class="metric-val" id="mDvsStatic">Estático</div>
+        </div>
+      </div>
+
+      <div class="card-title">Disparos Acumulados por Classe (Spike Counts)</div>
+      <div class="bars" id="barsContainer"></div>
+      <div class="status-line" id="statusLine">Conectando ao motor SpikeVision-S3...</div>
+    </section>
+  </main>
+
+  <script>
+    const canvas = document.getElementById("drawCanvas");
+    const ctx = canvas.getContext("2d", { willReadFrequently: true });
+    let classNames = ["0","1","2","3","4","5","6","7","8","9"];
+    let totalTimesteps = 8;
+    let drawing = false;
+    let inferTimer = null;
+
+    function clearCanvas() {
+      ctx.fillStyle = "#000000";
+      ctx.fillRect(0, 0, 32, 32);
+    }
+
+    function drawPreset(name) {
+      clearCanvas();
+      if (name === "gradient") {
+        for (let y = 0; y < 32; y++) {
+          for (let x = 0; x < 32; x++) {
+            ctx.fillStyle = `rgb(${x * 8}, ${y * 8}, ${255 - x * 4})`;
+            ctx.fillRect(x, y, 1, 1);
+          }
+        }
+      } else if (name === "checker") {
+        for (let y = 0; y < 32; y += 4) {
+          for (let x = 0; x < 32; x += 4) {
+            ctx.fillStyle = ((x + y) / 4) % 2 === 0 ? "#e2e8f0" : "#1e293b";
+            ctx.fillRect(x, y, 4, 4);
+          }
+        }
+      } else if (name === "noise") {
+        const img = ctx.createImageData(32, 32);
+        for (let i = 0; i < img.data.length; i += 4) {
+          img.data[i] = Math.floor(Math.random() * 256);
+          img.data[i + 1] = Math.floor(Math.random() * 256);
+          img.data[i + 2] = Math.floor(Math.random() * 256);
+          img.data[i + 3] = 255;
+        }
+        ctx.putImageData(img, 0, 0);
+      } else if (name === "cat") {
+        ctx.fillStyle = "#d97706";
+        ctx.fillRect(9, 11, 14, 13);
+        ctx.beginPath();
+        ctx.moveTo(9, 11); ctx.lineTo(12, 4); ctx.lineTo(15, 11); ctx.fill();
+        ctx.beginPath();
+        ctx.moveTo(23, 11); ctx.lineTo(20, 4); ctx.lineTo(17, 11); ctx.fill();
+        ctx.fillStyle = "#10b981";
+        ctx.fillRect(12, 14, 2, 2);
+        ctx.fillRect(18, 14, 2, 2);
+        ctx.fillStyle = "#f43f5e";
+        ctx.fillRect(15, 18, 2, 2);
+      }
+    }
+
+    function paintAt(ev) {
+      const rect = canvas.getBoundingClientRect();
+      const x = Math.floor(((ev.clientX - rect.left) / rect.width) * 32);
+      const y = Math.floor(((ev.clientY - rect.top) / rect.height) * 32);
+      const size = parseInt(document.getElementById("brushSize").value, 10);
+      const offset = Math.floor(size / 2);
+      ctx.fillStyle = document.getElementById("brushColor").value;
+      ctx.fillRect(x - offset, y - offset, size, size);
+      if (document.getElementById("autoInfer").checked) {
+        clearTimeout(inferTimer);
+        inferTimer = setTimeout(runInfer, 60);
+      }
+    }
+
+    canvas.addEventListener("pointerdown", (e) => { drawing = true; paintAt(e); });
+    window.addEventListener("pointerup", () => { drawing = false; });
+    canvas.addEventListener("pointermove", (e) => { if (drawing) paintAt(e); });
+
+    document.getElementById("brushSize").addEventListener("input", (e) => {
+      document.getElementById("brushSizeVal").textContent = e.target.value;
+    });
+
+    document.getElementById("presetSelect").addEventListener("change", (e) => {
+      if (e.target.value) {
+        drawPreset(e.target.value);
+        runInfer();
+      }
+    });
+
+    document.getElementById("btnClear").addEventListener("click", () => {
+      clearCanvas();
+      runInfer();
+    });
+
+    document.getElementById("btnInfer").addEventListener("click", runInfer);
+
+    document.getElementById("btnResetDvs").addEventListener("click", async () => {
+      const res = await fetch("/api/reset-dvs", { method: "POST" });
+      const data = await res.json();
+      document.getElementById("statusLine").textContent =
+        res.ok ? "Estado Pseudo-DVS reiniciado." : `Erro: ${data.error}`;
+    });
+
+    document.getElementById("imgUpload").addEventListener("change", (e) => {
+      const file = e.target.files[0];
+      if (!file) return;
+      const img = new Image();
+      img.onload = () => {
+        clearCanvas();
+        ctx.drawImage(img, 0, 0, 32, 32);
+        URL.revokeObjectURL(img.src);
+        runInfer();
+      };
+      img.src = URL.createObjectURL(file);
+    });
+
+    function buildBars(names) {
+      const container = document.getElementById("barsContainer");
+      container.innerHTML = "";
+      names.forEach((name, idx) => {
+        const row = document.createElement("div");
+        row.className = "bar-row";
+        row.id = `barRow-${idx}`;
+        row.innerHTML = `
+          <div class="bar-label">${name}</div>
+          <div class="bar-track"><div class="bar-fill" id="barFill-${idx}"></div></div>
+          <div class="bar-num" id="barNum-${idx}">0</div>
+        `;
+        container.appendChild(row);
+      });
+    }
+
+    async function loadInfo() {
+      try {
+        const res = await fetch("/api/info");
+        const info = await res.json();
+        document.getElementById("infoSimd").textContent = info.simd || "—";
+        document.getElementById("infoSram").textContent =
+          info.sram_bytes ? `${(info.sram_bytes / 1024).toFixed(2)} KB` : "—";
+        totalTimesteps = info.timesteps || 8;
+        document.getElementById("infoT").textContent = totalTimesteps;
+        document.getElementById("infoVer").textContent = info.version || "1.0";
+        if (Array.isArray(info.class_names)) {
+          classNames = info.class_names;
+        }
+        buildBars(classNames);
+        document.getElementById("statusLine").textContent = "Conectado. Desenhe ou selecione um preset.";
+      } catch (err) {
+        document.getElementById("connDot").style.background = "var(--danger)";
+        document.getElementById("statusLine").textContent = `Falha na conexão: ${err}`;
+      }
+    }
+
+    async function runInfer() {
+      const img = ctx.getImageData(0, 0, 32, 32).data;
+      const rgb = new Array(32 * 32 * 3);
+      for (let i = 0, j = 0; i < img.length; i += 4, j += 3) {
+        rgb[j] = img[i];
+        rgb[j + 1] = img[i + 1];
+        rgb[j + 2] = img[i + 2];
+      }
+      const earlyExit = document.getElementById("eeMode").value;
+      const useDvs = document.getElementById("useDvs").checked;
+
+      try {
+        const res = await fetch("/api/infer", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            mode: "rgb888",
+            width: 32,
+            height: 32,
+            data: rgb,
+            early_exit: earlyExit,
+            use_dvs: useDvs,
+          }),
+        });
+        const data = await res.json();
+        if (!res.ok) {
+          document.getElementById("statusLine").textContent = `Erro: ${data.error}`;
+          return;
+        }
+        updateTelemetry(data, useDvs);
+      } catch (err) {
+        document.getElementById("statusLine").textContent = `Erro de rede: ${err}`;
+      }
+    }
+
+    function updateTelemetry(d, useDvs) {
+      const predName = classNames[d.pred] || `class_${d.pred}`;
+      document.getElementById("mPred").textContent = predName;
+      document.getElementById("mPredIdx").textContent = `índice ${d.pred}`;
+      document.getElementById("mLat").textContent = `${d.latency_us} µs`;
+      const fps = d.latency_us > 0 ? (1e6 / d.latency_us).toFixed(0) : "∞";
+      document.getElementById("mFps").textContent = `${fps} FPS`;
+      document.getElementById("mSops").textContent = Number(d.total_sops).toLocaleString("pt-BR");
+      document.getElementById("mSparsity").textContent = `Esparsidade ${Number(d.sparsity).toFixed(2)}%`;
+      document.getElementById("mSteps").textContent = `${d.timesteps_executed} / ${totalTimesteps}`;
+      document.getElementById("mEeBadge").textContent = d.early_exited ? "Early-Exit Ativo" : "Full T";
+
+      const dvsStrip = document.getElementById("dvsStrip");
+      if (useDvs && d.dvs_on !== undefined) {
+        dvsStrip.classList.add("visible");
+        document.getElementById("mDvsOn").textContent = d.dvs_on;
+        document.getElementById("mDvsOff").textContent = d.dvs_off;
+        document.getElementById("mDvsSp").textContent = `${Number(d.dvs_sparsity).toFixed(1)}%`;
+        document.getElementById("mDvsStatic").textContent = d.dvs_static ? "Estático" : "Movimento";
+      } else {
+        dvsStrip.classList.remove("visible");
+      }
+
+      const counts = d.spike_counts || [];
+      const maxSpk = Math.max(1, ...counts);
+      counts.forEach((val, idx) => {
+        const row = document.getElementById(`barRow-${idx}`);
+        const fill = document.getElementById(`barFill-${idx}`);
+        const num = document.getElementById(`barNum-${idx}`);
+        if (!row) return;
+        row.classList.toggle("winner", idx === d.pred);
+        fill.style.width = `${Math.round((val / maxSpk) * 100)}%`;
+        num.textContent = val;
+      });
+      document.getElementById("statusLine").textContent =
+        `Última inferência concluída em ${d.latency_us} µs.`;
+    }
+
+    clearCanvas();
+    loadInfo().then(() => {
+      drawPreset("cat");
+      runInfer();
+    });
+  </script>
+</body>
+</html>
