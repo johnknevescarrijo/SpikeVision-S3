@@ -11,6 +11,8 @@
 #include <stdbool.h>
 #include "snn_engine.h"
 #include "snn_pipeline.h"
+#include "image_preprocess.h"
+#include "camera_capture.h"
 #include "test_samples.h"
 
 #if defined(ESP_PLATFORM)
@@ -307,6 +309,161 @@ static int run_pipeline_validation(void) {
     return 1;
 }
 
+static bool verify_solid_chw32(const int8_t* chw, int8_t exp_r, int8_t exp_g, int8_t exp_b) {
+    for (int i = 0; i < IMG_PREPROC_PLANE; ++i) {
+        if (chw[i] < 0 ||
+            chw[IMG_PREPROC_PLANE + i] < 0 ||
+            chw[2 * IMG_PREPROC_PLANE + i] < 0) {
+            return false;
+        }
+        if (chw[i] != exp_r ||
+            chw[IMG_PREPROC_PLANE + i] != exp_g ||
+            chw[2 * IMG_PREPROC_PLANE + i] != exp_b) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static int run_camera_preprocess_validation(void) {
+    printf("📷 [Validação de Câmera & Pré-Processamento RGB -> 32x32 CHW [0..127]]:\n");
+    printf("  • Driver Hardware esp_camera: %s\n",
+           camera_capture_has_hardware_driver() ? "Disponível (ESP-IDF)" : "Indisponível (Fallback Sintético CI)");
+
+    static uint16_t s_rgb565_buf[160 * 120];
+    static uint8_t  s_rgb888_buf[96 * 96 * 3];
+    static uint8_t  s_gray8_buf[96 * 96];
+    static int8_t   s_chw32[IMG_PREPROC_BYTES];
+
+    int checks_passed = 0;
+    int checks_total = 0;
+
+    /* 1. Cores puras R, G, B, Branco e Preto em RGB565 (com e sem swap_bytes) */
+    struct ColorCase565 {
+        uint16_t px;
+        int8_t r;
+        int8_t g;
+        int8_t b;
+    };
+    const ColorCase565 cases565[] = {
+        { 0xF800u, 127,   0,   0 }, /* Vermelho puro */
+        { 0x07E0u,   0, 127,   0 }, /* Verde puro    */
+        { 0x001Fu,   0,   0, 127 }, /* Azul puro     */
+        { 0xFFFFu, 127, 127, 127 }, /* Branco        */
+        { 0x0000u,   0,   0,   0 }, /* Preto         */
+    };
+
+    bool rgb565_ok = true;
+    for (size_t c = 0; c < sizeof(cases565) / sizeof(cases565[0]); ++c) {
+        /* 96x96 -> 32x32 sem swap */
+        for (int i = 0; i < 96 * 96; ++i) {
+            s_rgb565_buf[i] = cases565[c].px;
+        }
+        img_rgb565_to_chw32(s_rgb565_buf, 96, 96, false, s_chw32);
+        if (!verify_solid_chw32(s_chw32, cases565[c].r, cases565[c].g, cases565[c].b)) {
+            rgb565_ok = false;
+        }
+
+        /* 96x96 -> 32x32 com swap_bytes=true (bytes invertidos na entrada) */
+        const uint16_t swapped_px = static_cast<uint16_t>((cases565[c].px >> 8) | (cases565[c].px << 8));
+        for (int i = 0; i < 96 * 96; ++i) {
+            s_rgb565_buf[i] = swapped_px;
+        }
+        img_rgb565_to_chw32(s_rgb565_buf, 96, 96, true, s_chw32);
+        if (!verify_solid_chw32(s_chw32, cases565[c].r, cases565[c].g, cases565[c].b)) {
+            rgb565_ok = false;
+        }
+    }
+    checks_total++;
+    if (rgb565_ok) checks_passed++;
+
+    /* 2. Cores puras R, G, B, Branco e Preto em RGB888 (96x96 -> 32x32) */
+    struct ColorCase888 {
+        uint8_t r8, g8, b8;
+        int8_t  r,  g,  b;
+    };
+    const ColorCase888 cases888[] = {
+        { 255,   0,   0, 127,   0,   0 },
+        {   0, 255,   0,   0, 127,   0 },
+        {   0,   0, 255,   0,   0, 127 },
+        { 255, 255, 255, 127, 127, 127 },
+        {   0,   0,   0,   0,   0,   0 },
+    };
+
+    bool rgb888_ok = true;
+    for (size_t c = 0; c < sizeof(cases888) / sizeof(cases888[0]); ++c) {
+        for (int i = 0; i < 96 * 96; ++i) {
+            s_rgb888_buf[i * 3 + 0] = cases888[c].r8;
+            s_rgb888_buf[i * 3 + 1] = cases888[c].g8;
+            s_rgb888_buf[i * 3 + 2] = cases888[c].b8;
+        }
+        img_rgb888_to_chw32(s_rgb888_buf, 96, 96, s_chw32);
+        if (!verify_solid_chw32(s_chw32, cases888[c].r, cases888[c].g, cases888[c].b)) {
+            rgb888_ok = false;
+        }
+    }
+    checks_total++;
+    if (rgb888_ok) checks_passed++;
+
+    /* 3. Gray8 (96x96 -> 32x32) replicado nos 3 canais CHW */
+    for (int i = 0; i < 96 * 96; ++i) {
+        s_gray8_buf[i] = 255;
+    }
+    img_gray8_to_chw32(s_gray8_buf, 96, 96, s_chw32);
+    checks_total++;
+    if (verify_solid_chw32(s_chw32, 127, 127, 127)) checks_passed++;
+
+    /* 4. Center-crop + box average em 160x120 -> 32x32 (bordas laterais vermelhas descartadas, centro verde preservado) */
+    for (int y = 0; y < 120; ++y) {
+        for (int x = 0; x < 160; ++x) {
+            const bool in_center = (x >= 20 && x < 140);
+            s_rgb565_buf[y * 160 + x] = in_center ? 0x07E0u : 0xF800u;
+        }
+    }
+    img_rgb565_to_chw32(s_rgb565_buf, 160, 120, false, s_chw32);
+    checks_total++;
+    if (verify_solid_chw32(s_chw32, 0, 127, 0)) checks_passed++;
+
+    /* 5. Fluxo completo camera_capture_grab_chw32 -> snn_engine_infer */
+    camera_capture_cfg_t cam_cfg = camera_capture_default_cfg(CAM_PRESET_ESP32S3_EYE);
+    cam_cfg.enable_synthetic_fallback = true;
+    uint32_t capture_us = 0;
+    bool e2e_ok = false;
+
+    if (camera_capture_init(&cam_cfg)) {
+        if (camera_capture_grab_chw32(s_chw32, &capture_us)) {
+            bool bounds_ok = true;
+            for (int i = 0; i < IMG_PREPROC_BYTES; ++i) {
+                if (s_chw32[i] < 0) {
+                    bounds_ok = false;
+                    break;
+                }
+            }
+            if (bounds_ok) {
+                SNNInferenceResult cam_res;
+                snn_engine_infer(reinterpret_cast<const uint8_t*>(s_chw32), &cam_res);
+                if (cam_res.predicted_class >= 0 &&
+                    cam_res.predicted_class < SPIKEVISION_NUM_CLASSES &&
+                    cam_res.timesteps_executed == SPIKEVISION_TIMESTEPS) {
+                    e2e_ok = true;
+                }
+            }
+        }
+        camera_capture_deinit();
+    }
+    checks_total++;
+    if (e2e_ok) checks_passed++;
+
+    if (checks_passed == checks_total) {
+        printf("  • Testes RGB565/RGB888/Gray8 + Center-Crop 160x120 + Captura->SNN: \033[32m%d/%d PASS\033[0m (cap=%" PRIu32 " us)\n\n",
+               checks_passed, checks_total, capture_us);
+        return 0;
+    }
+
+    printf("  • Testes Câmera & Pré-processamento: \033[31m%d/%d FALHA\033[0m\n\n", checks_passed, checks_total);
+    return 1;
+}
+
 #if defined(ESP_PLATFORM)
 extern "C" void app_main(void) {
     print_banner();
@@ -315,6 +472,7 @@ extern "C" void app_main(void) {
     run_validation_suite();
     run_pipeline_validation();
     run_early_exit_benchmark();
+    run_camera_preprocess_validation();
 
     ESP_LOGI(TAG, "SpikeVision-S3 Neuromorphic Engine executado com sucesso.");
     vTaskDelay(pdMS_TO_TICKS(1000));
@@ -329,6 +487,7 @@ int main(int argc, char** argv) {
     int rc = run_validation_suite();
     int pipe_rc = run_pipeline_validation();
     int ee_rc = run_early_exit_benchmark();
-    return (rc != 0 || pipe_rc != 0 || ee_rc != 0) ? 1 : 0;
+    int cam_rc = run_camera_preprocess_validation();
+    return (rc != 0 || pipe_rc != 0 || ee_rc != 0 || cam_rc != 0) ? 1 : 0;
 }
 #endif
