@@ -21,27 +21,46 @@
  * Zero chamadas a malloc/free durante a inferência.
  * ========================================================================= */
 
-/* Camada 1: Entrada 3x32x32 -> Conv 16x32x32 -> MaxPool 16x16x16 */
-SPIKEVISION_ALIGN16 static int32_t s_cur1[CONV1_OUT_CHANNELS][32][32];
-SPIKEVISION_ALIGN16 static int32_t s_pool1[CONV1_OUT_CHANNELS][POOL1_OUT_H][POOL1_OUT_W];
-SPIKEVISION_ALIGN16 static int32_t s_mem1[CONV1_OUT_CHANNELS][POOL1_OUT_H][POOL1_OUT_W];
-SPIKEVISION_ALIGN16 static uint8_t s_spk1[CONV1_OUT_CHANNELS][POOL1_OUT_H][POOL1_OUT_W];
+#define SNN_BITPACK_WORDS(n) (((n) + 31) / 32)
+#define L1_SPK_ELEMS         (CONV1_OUT_CHANNELS * POOL1_OUT_H * POOL1_OUT_W)
+#define L2_SPK_ELEMS         (CONV2_OUT_CHANNELS * POOL2_OUT_H * POOL2_OUT_W)
+#define L3_SPK_ELEMS         (CONV3_OUT_CHANNELS * POOL3_OUT_H * POOL3_OUT_W)
 
-/* Camada 2: Conv 32x16x16 -> MaxPool 32x8x8 */
-SPIKEVISION_ALIGN16 static int32_t s_cur2[CONV2_OUT_CHANNELS][16][16];
-SPIKEVISION_ALIGN16 static int32_t s_pool2[CONV2_OUT_CHANNELS][POOL2_OUT_H][POOL2_OUT_W];
-SPIKEVISION_ALIGN16 static int32_t s_mem2[CONV2_OUT_CHANNELS][POOL2_OUT_H][POOL2_OUT_W];
-SPIKEVISION_ALIGN16 static uint8_t s_spk2[CONV2_OUT_CHANNELS][POOL2_OUT_H][POOL2_OUT_W];
+#define L1_SPK_WORDS         SNN_BITPACK_WORDS(L1_SPK_ELEMS)
+#define L2_SPK_WORDS         SNN_BITPACK_WORDS(L2_SPK_ELEMS)
+#define L3_SPK_WORDS         SNN_BITPACK_WORDS(L3_SPK_ELEMS)
 
-/* Camada 3: Conv 32x8x8 -> MaxPool 32x4x4 */
-SPIKEVISION_ALIGN16 static int32_t s_cur3[CONV3_OUT_CHANNELS][8][8];
-SPIKEVISION_ALIGN16 static int32_t s_pool3[CONV3_OUT_CHANNELS][POOL3_OUT_H][POOL3_OUT_W];
-SPIKEVISION_ALIGN16 static int32_t s_mem3[CONV3_OUT_CHANNELS][POOL3_OUT_H][POOL3_OUT_W];
-SPIKEVISION_ALIGN16 static uint8_t s_spk3[CONV3_OUT_CHANNELS][POOL3_OUT_H][POOL3_OUT_W];
+#define L2_CUR_ELEMS         (CONV2_OUT_CHANNELS * 16 * 16)
+#define L3_CUR_ELEMS         (CONV3_OUT_CHANNELS * 8 * 8)
+#define SCRATCH_CUR_ELEMS    ((L2_CUR_ELEMS > L3_CUR_ELEMS) ? L2_CUR_ELEMS : L3_CUR_ELEMS)
 
-/* Camada 4: Linear Head 512 -> 2 */
+/* Scratchpad compartilhado de correntes pós-sinápticas (Camadas 2 e 3): 32 KB */
+SPIKEVISION_ALIGN16 static int32_t s_scratch_cur[SCRATCH_CUR_ELEMS];
+
+/* Camada 1: MaxPool 16x16x16 persistente para os T timesteps + estado LIF + spikes bit-packed */
+SPIKEVISION_ALIGN16 static int32_t  s_pool1[CONV1_OUT_CHANNELS][POOL1_OUT_H][POOL1_OUT_W];
+SPIKEVISION_ALIGN16 static int32_t  s_mem1[CONV1_OUT_CHANNELS][POOL1_OUT_H][POOL1_OUT_W];
+SPIKEVISION_ALIGN16 static uint32_t s_spk1[L1_SPK_WORDS];
+
+/* Camada 2: estado LIF 32x8x8 + spikes bit-packed (MaxPool fundido no loop LIF) */
+SPIKEVISION_ALIGN16 static int32_t  s_mem2[CONV2_OUT_CHANNELS][POOL2_OUT_H][POOL2_OUT_W];
+SPIKEVISION_ALIGN16 static uint32_t s_spk2[L2_SPK_WORDS];
+
+/* Camada 3: estado LIF 32x4x4 + spikes bit-packed (MaxPool fundido no loop LIF) */
+SPIKEVISION_ALIGN16 static int32_t  s_mem3[CONV3_OUT_CHANNELS][POOL3_OUT_H][POOL3_OUT_W];
+SPIKEVISION_ALIGN16 static uint32_t s_spk3[L3_SPK_WORDS];
+
+/* Camada 4: Linear Head */
 SPIKEVISION_ALIGN16 static int32_t s_mem4[FC_OUT_FEATURES];
 SPIKEVISION_ALIGN16 static int32_t s_spk_counts[FC_OUT_FEATURES];
+
+static inline void spk_clear_all(uint32_t* buf, size_t num_words) {
+    memset(buf, 0, num_words * sizeof(uint32_t));
+}
+
+static inline void spk_set(uint32_t* buf, int idx) {
+    buf[idx >> 5] |= (1u << (idx & 31));
+}
 
 /* =========================================================================
  * Dinâmica Leaky LIF em Ponto Fixo 16-bit
@@ -97,30 +116,32 @@ static inline int32_t vth_fc(int c) {
  * ========================================================================= */
 
 void snn_engine_init(void) {
-    memset(s_cur1, 0, sizeof(s_cur1));
+    memset(s_scratch_cur, 0, sizeof(s_scratch_cur));
+
     memset(s_pool1, 0, sizeof(s_pool1));
     memset(s_mem1, 0, sizeof(s_mem1));
-    memset(s_spk1, 0, sizeof(s_spk1));
+    spk_clear_all(s_spk1, L1_SPK_WORDS);
 
-    memset(s_cur2, 0, sizeof(s_cur2));
-    memset(s_pool2, 0, sizeof(s_pool2));
     memset(s_mem2, 0, sizeof(s_mem2));
-    memset(s_spk2, 0, sizeof(s_spk2));
+    spk_clear_all(s_spk2, L2_SPK_WORDS);
 
-    memset(s_cur3, 0, sizeof(s_cur3));
-    memset(s_pool3, 0, sizeof(s_pool3));
     memset(s_mem3, 0, sizeof(s_mem3));
-    memset(s_spk3, 0, sizeof(s_spk3));
+    spk_clear_all(s_spk3, L3_SPK_WORDS);
 
     memset(s_mem4, 0, sizeof(s_mem4));
     memset(s_spk_counts, 0, sizeof(s_spk_counts));
 }
 
-size_t snn_engine_get_sram_usage(void) {
-    return sizeof(s_cur1) + sizeof(s_pool1) + sizeof(s_mem1) + sizeof(s_spk1) +
-           sizeof(s_cur2) + sizeof(s_pool2) + sizeof(s_mem2) + sizeof(s_spk2) +
-           sizeof(s_cur3) + sizeof(s_pool3) + sizeof(s_mem3) + sizeof(s_spk3) +
+size_t snn_engine_get_sram_bytes(void) {
+    return sizeof(s_scratch_cur) +
+           sizeof(s_pool1) + sizeof(s_mem1) + sizeof(s_spk1) +
+           sizeof(s_mem2) + sizeof(s_spk2) +
+           sizeof(s_mem3) + sizeof(s_spk3) +
            sizeof(s_mem4) + sizeof(s_spk_counts);
+}
+
+size_t snn_engine_get_sram_usage(void) {
+    return snn_engine_get_sram_bytes();
 }
 
 static inline bool should_early_exit(
@@ -165,6 +186,26 @@ static inline bool should_early_exit(
     return gap > remaining;
 }
 
+static inline int32_t conv1_pixel(const uint8_t* image_chw, int och, int32_t bias, int y, int x) {
+    int32_t acc = bias;
+    for (int ich = 0; ich < CONV1_IN_CHANNELS; ich++) {
+        const uint8_t* in_plane = image_chw + ich * (32 * 32);
+        for (int ky = 0; ky < 3; ky++) {
+            int iy = y + ky - 1;
+            if (iy < 0 || iy >= 32) continue;
+            for (int kx = 0; kx < 3; kx++) {
+                int ix = x + kx - 1;
+                if (ix < 0 || ix >= 32) continue;
+
+                int8_t w = conv1_weights[((och * 3 + ich) * 3 + ky) * 3 + kx];
+                uint8_t px = in_plane[iy * 32 + ix];
+                acc += (int32_t)px * (int32_t)w;
+            }
+        }
+    }
+    return acc;
+}
+
 void snn_engine_infer(const uint8_t* image_chw, SNNInferenceResult* result) {
     snn_engine_infer_adaptive(image_chw, result, nullptr);
 }
@@ -205,45 +246,24 @@ void snn_engine_infer_adaptive(
     uint32_t total_spks_l3 = 0;
     uint32_t total_spks_l4 = 0;
 
-    /* 3. CAMADA 1: Direct Coding Convolucional (Calculada 1x por Imagem)
+    /* 3. CAMADA 1: Direct Coding Convolucional + MaxPool2d(2) Fundidos (Calculada 1x por Imagem)
      * Como a imagem de entrada é estática ao longo dos 8 timesteps, a convolução
-     * 3x3 + bias + MaxPool2d é pré-calculada uma única vez, gerando economia de 8x!
+     * 3x3 + bias + MaxPool2d é pré-calculada uma única vez direto para s_pool1,
+     * eliminando completamente o buffer intermediário s_cur1 (64 KB)!
      */
     for (int och = 0; och < CONV1_OUT_CHANNELS; och++) {
         int32_t bias = conv1_bias[och];
-        for (int y = 0; y < 32; y++) {
-            for (int x = 0; x < 32; x++) {
-                int32_t acc = bias;
-                for (int ich = 0; ich < CONV1_IN_CHANNELS; ich++) {
-                    const uint8_t* in_plane = image_chw + ich * (32 * 32);
-                    for (int ky = 0; ky < 3; ky++) {
-                        int iy = y + ky - 1;
-                        if (iy < 0 || iy >= 32) continue;
-                        for (int kx = 0; kx < 3; kx++) {
-                            int ix = x + kx - 1;
-                            if (ix < 0 || ix >= 32) continue;
-
-                            int8_t w = conv1_weights[((och * 3 + ich) * 3 + ky) * 3 + kx];
-                            uint8_t px = in_plane[iy * 32 + ix];
-                            acc += (int32_t)px * (int32_t)w;
-                        }
-                    }
-                }
-                s_cur1[och][y][x] = acc;
-            }
-        }
-    }
-
-    /* MaxPool2d(2, stride=2) Camada 1: 32x32 -> 16x16 */
-    for (int och = 0; och < CONV1_OUT_CHANNELS; och++) {
         for (int py = 0; py < POOL1_OUT_H; py++) {
+            int y0 = py * 2;
             for (int px = 0; px < POOL1_OUT_W; px++) {
-                int y0 = py * 2;
                 int x0 = px * 2;
-                int32_t m = s_cur1[och][y0][x0];
-                if (s_cur1[och][y0][x0 + 1] > m) m = s_cur1[och][y0][x0 + 1];
-                if (s_cur1[och][y0 + 1][x0] > m) m = s_cur1[och][y0 + 1][x0];
-                if (s_cur1[och][y0 + 1][x0 + 1] > m) m = s_cur1[och][y0 + 1][x0 + 1];
+                int32_t m = conv1_pixel(image_chw, och, bias, y0, x0);
+                int32_t v01 = conv1_pixel(image_chw, och, bias, y0, x0 + 1);
+                if (v01 > m) m = v01;
+                int32_t v10 = conv1_pixel(image_chw, och, bias, y0 + 1, x0);
+                if (v10 > m) m = v10;
+                int32_t v11 = conv1_pixel(image_chw, och, bias, y0 + 1, x0 + 1);
+                if (v11 > m) m = v11;
                 s_pool1[och][py][px] = m;
             }
         }
@@ -255,7 +275,8 @@ void snn_engine_infer_adaptive(
     for (int t = 0; t < SPIKEVISION_TIMESTEPS; t++) {
         timesteps_executed = t + 1;
 
-        /* --- CAMADA 1: Leaky LIF (16 x 16 x 16) --- */
+        /* --- CAMADA 1: Leaky LIF (16 x 16 x 16) com Bit-Packing --- */
+        spk_clear_all(s_spk1, L1_SPK_WORDS);
         for (int och = 0; och < CONV1_OUT_CHANNELS; och++) {
             int32_t vth = vth_l1(och);
             for (int y = 0; y < POOL1_OUT_H; y++) {
@@ -263,166 +284,181 @@ void snn_engine_infer_adaptive(
                     int32_t m = s_mem1[och][y][x];
                     int32_t r = (m >= vth) ? 1 : 0;
                     m = lif_decay_32(m) + s_pool1[och][y][x] - r * vth;
-                    uint8_t s = (m >= vth) ? 1 : 0;
+                    if (m >= vth) {
+                        int idx = (och * POOL1_OUT_H + y) * POOL1_OUT_W + x;
+                        spk_set(s_spk1, idx);
+                        total_spks_l1++;
+                    }
                     s_mem1[och][y][x] = m;
-                    s_spk1[och][y][x] = s;
-                    total_spks_l1 += s;
                 }
             }
         }
 
-        /* --- CAMADA 2: Convolução Esparsa Orientada a Eventos (SOP) ---
-         * Se spk1 == 0 (repouso / silêncio sináptico), nada é computado.
-         * Se spk1 == 1, realizamos exclusivamente adições inteiras (SOPs).
+        /* --- CAMADA 2: Convolução Esparsa Orientada a Eventos (SOP) com __builtin_ctz ---
+         * Pula blocos inteiros de 32 neurônios silenciosos com if (mask == 0) continue;
          */
         for (int och = 0; och < CONV2_OUT_CHANNELS; och++) {
             int32_t b = conv2_bias[och];
-            for (int y = 0; y < 16; y++) {
-                for (int x = 0; x < 16; x++) {
-                    s_cur2[och][y][x] = b;
-                }
+            int32_t* cur_plane = &s_scratch_cur[och * (16 * 16)];
+            for (int i = 0; i < 16 * 16; i++) {
+                cur_plane[i] = b;
             }
         }
 
-        for (int ich = 0; ich < CONV2_IN_CHANNELS; ich++) {
-            for (int iy = 0; iy < 16; iy++) {
-                for (int ix = 0; ix < 16; ix++) {
-                    if (s_spk1[ich][iy][ix] == 0) continue; // Salto neuromórfico!
+        for (int word_idx = 0; word_idx < L1_SPK_WORDS; word_idx++) {
+            uint32_t mask = s_spk1[word_idx];
+            if (mask == 0) continue;
 
-                    for (int ky = 0; ky < 3; ky++) {
-                        int y = iy - ky + 1;
-                        if (y < 0 || y >= 16) continue;
-                        for (int kx = 0; kx < 3; kx++) {
-                            int x = ix - kx + 1;
-                            if (x < 0 || x >= 16) continue;
+            while (mask) {
+                int bit = __builtin_ctz(mask);
+                mask &= (mask - 1);
+                int idx = (word_idx << 5) + bit;
 
-                            for (int och = 0; och < CONV2_OUT_CHANNELS; och++) {
-                                int8_t w = conv2_weights[((och * 16 + ich) * 3 + ky) * 3 + kx];
-                                s_cur2[och][y][x] += w;
-                                active_sops++;
-                            }
+                int ich = idx / (POOL1_OUT_H * POOL1_OUT_W);
+                int rem = idx % (POOL1_OUT_H * POOL1_OUT_W);
+                int iy = rem / POOL1_OUT_W;
+                int ix = rem % POOL1_OUT_W;
+
+                for (int ky = 0; ky < 3; ky++) {
+                    int y = iy - ky + 1;
+                    if (y < 0 || y >= 16) continue;
+                    for (int kx = 0; kx < 3; kx++) {
+                        int x = ix - kx + 1;
+                        if (x < 0 || x >= 16) continue;
+
+                        int out_offset = y * 16 + x;
+                        for (int och = 0; och < CONV2_OUT_CHANNELS; och++) {
+                            int8_t w = conv2_weights[((och * 16 + ich) * 3 + ky) * 3 + kx];
+                            s_scratch_cur[och * (16 * 16) + out_offset] += w;
+                            active_sops++;
                         }
                     }
                 }
             }
         }
 
-        /* MaxPool2d(2, stride=2) Camada 2: 16x16 -> 8x8 */
-        for (int och = 0; och < CONV2_OUT_CHANNELS; och++) {
-            for (int py = 0; py < POOL2_OUT_H; py++) {
-                for (int px = 0; px < POOL2_OUT_W; px++) {
-                    int y0 = py * 2;
-                    int x0 = px * 2;
-                    int32_t m = s_cur2[och][y0][x0];
-                    if (s_cur2[och][y0][x0 + 1] > m) m = s_cur2[och][y0][x0 + 1];
-                    if (s_cur2[och][y0 + 1][x0] > m) m = s_cur2[och][y0 + 1][x0];
-                    if (s_cur2[och][y0 + 1][x0 + 1] > m) m = s_cur2[och][y0 + 1][x0 + 1];
-                    s_pool2[och][py][px] = m;
-                }
-            }
-        }
-
-        /* Camada 2: Leaky LIF (32 x 8 x 8) */
+        /* Camada 2: MaxPool2d(2) fundido ao Leaky LIF (32 x 8 x 8) com Bit-Packing */
+        spk_clear_all(s_spk2, L2_SPK_WORDS);
         for (int och = 0; och < CONV2_OUT_CHANNELS; och++) {
             int32_t vth = vth_l2(och);
-            for (int y = 0; y < POOL2_OUT_H; y++) {
-                for (int x = 0; x < POOL2_OUT_W; x++) {
-                    int32_t m = s_mem2[och][y][x];
+            const int32_t* cur_plane = &s_scratch_cur[och * (16 * 16)];
+            for (int py = 0; py < POOL2_OUT_H; py++) {
+                int y0 = py * 2;
+                for (int px = 0; px < POOL2_OUT_W; px++) {
+                    int x0 = px * 2;
+                    int32_t pool_val = cur_plane[y0 * 16 + x0];
+                    int32_t v01 = cur_plane[y0 * 16 + (x0 + 1)];
+                    if (v01 > pool_val) pool_val = v01;
+                    int32_t v10 = cur_plane[(y0 + 1) * 16 + x0];
+                    if (v10 > pool_val) pool_val = v10;
+                    int32_t v11 = cur_plane[(y0 + 1) * 16 + (x0 + 1)];
+                    if (v11 > pool_val) pool_val = v11;
+
+                    int32_t m = s_mem2[och][py][px];
                     int32_t r = (m >= vth) ? 1 : 0;
-                    m = lif_decay_32(m) + s_pool2[och][y][x] - r * vth;
-                    uint8_t s = (m >= vth) ? 1 : 0;
-                    s_mem2[och][y][x] = m;
-                    s_spk2[och][y][x] = s;
-                    total_spks_l2 += s;
+                    m = lif_decay_32(m) + pool_val - r * vth;
+                    if (m >= vth) {
+                        int idx = (och * POOL2_OUT_H + py) * POOL2_OUT_W + px;
+                        spk_set(s_spk2, idx);
+                        total_spks_l2++;
+                    }
+                    s_mem2[och][py][px] = m;
                 }
             }
         }
 
-        /* --- CAMADA 3: Convolução Esparsa Orientada a Eventos (SOP) --- */
+        /* --- CAMADA 3: Convolução Esparsa Orientada a Eventos (SOP) com __builtin_ctz --- */
         for (int och = 0; och < CONV3_OUT_CHANNELS; och++) {
             int32_t b = conv3_bias[och];
-            for (int y = 0; y < 8; y++) {
-                for (int x = 0; x < 8; x++) {
-                    s_cur3[och][y][x] = b;
-                }
+            int32_t* cur_plane = &s_scratch_cur[och * (8 * 8)];
+            for (int i = 0; i < 8 * 8; i++) {
+                cur_plane[i] = b;
             }
         }
 
-        for (int ich = 0; ich < CONV3_IN_CHANNELS; ich++) {
-            for (int iy = 0; iy < 8; iy++) {
-                for (int ix = 0; ix < 8; ix++) {
-                    if (s_spk2[ich][iy][ix] == 0) continue; // Salto neuromórfico!
+        for (int word_idx = 0; word_idx < L2_SPK_WORDS; word_idx++) {
+            uint32_t mask = s_spk2[word_idx];
+            if (mask == 0) continue;
 
-                    for (int ky = 0; ky < 3; ky++) {
-                        int y = iy - ky + 1;
-                        if (y < 0 || y >= 8) continue;
-                        for (int kx = 0; kx < 3; kx++) {
-                            int x = ix - kx + 1;
-                            if (x < 0 || x >= 8) continue;
+            while (mask) {
+                int bit = __builtin_ctz(mask);
+                mask &= (mask - 1);
+                int idx = (word_idx << 5) + bit;
 
-                            for (int och = 0; och < CONV3_OUT_CHANNELS; och++) {
-                                int8_t w = conv3_weights[((och * 32 + ich) * 3 + ky) * 3 + kx];
-                                s_cur3[och][y][x] += w;
-                                active_sops++;
-                            }
+                int ich = idx / (POOL2_OUT_H * POOL2_OUT_W);
+                int rem = idx % (POOL2_OUT_H * POOL2_OUT_W);
+                int iy = rem / POOL2_OUT_W;
+                int ix = rem % POOL2_OUT_W;
+
+                for (int ky = 0; ky < 3; ky++) {
+                    int y = iy - ky + 1;
+                    if (y < 0 || y >= 8) continue;
+                    for (int kx = 0; kx < 3; kx++) {
+                        int x = ix - kx + 1;
+                        if (x < 0 || x >= 8) continue;
+
+                        int out_offset = y * 8 + x;
+                        for (int och = 0; och < CONV3_OUT_CHANNELS; och++) {
+                            int8_t w = conv3_weights[((och * 32 + ich) * 3 + ky) * 3 + kx];
+                            s_scratch_cur[och * (8 * 8) + out_offset] += w;
+                            active_sops++;
                         }
                     }
                 }
             }
         }
 
-        /* MaxPool2d(2, stride=2) Camada 3: 8x8 -> 4x4 */
-        for (int och = 0; och < CONV3_OUT_CHANNELS; och++) {
-            for (int py = 0; py < POOL3_OUT_H; py++) {
-                for (int px = 0; px < POOL3_OUT_W; px++) {
-                    int y0 = py * 2;
-                    int x0 = px * 2;
-                    int32_t m = s_cur3[och][y0][x0];
-                    if (s_cur3[och][y0][x0 + 1] > m) m = s_cur3[och][y0][x0 + 1];
-                    if (s_cur3[och][y0 + 1][x0] > m) m = s_cur3[och][y0 + 1][x0];
-                    if (s_cur3[och][y0 + 1][x0 + 1] > m) m = s_cur3[och][y0 + 1][x0 + 1];
-                    s_pool3[och][py][px] = m;
-                }
-            }
-        }
-
-        /* Camada 3: Leaky LIF (32 x 4 x 4) */
+        /* Camada 3: MaxPool2d(2) fundido ao Leaky LIF (32 x 4 x 4) com Bit-Packing */
+        spk_clear_all(s_spk3, L3_SPK_WORDS);
         for (int och = 0; och < CONV3_OUT_CHANNELS; och++) {
             int32_t vth = vth_l3(och);
-            for (int y = 0; y < POOL3_OUT_H; y++) {
-                for (int x = 0; x < POOL3_OUT_W; x++) {
-                    int32_t m = s_mem3[och][y][x];
+            const int32_t* cur_plane = &s_scratch_cur[och * (8 * 8)];
+            for (int py = 0; py < POOL3_OUT_H; py++) {
+                int y0 = py * 2;
+                for (int px = 0; px < POOL3_OUT_W; px++) {
+                    int x0 = px * 2;
+                    int32_t pool_val = cur_plane[y0 * 8 + x0];
+                    int32_t v01 = cur_plane[y0 * 8 + (x0 + 1)];
+                    if (v01 > pool_val) pool_val = v01;
+                    int32_t v10 = cur_plane[(y0 + 1) * 8 + x0];
+                    if (v10 > pool_val) pool_val = v10;
+                    int32_t v11 = cur_plane[(y0 + 1) * 8 + (x0 + 1)];
+                    if (v11 > pool_val) pool_val = v11;
+
+                    int32_t m = s_mem3[och][py][px];
                     int32_t r = (m >= vth) ? 1 : 0;
-                    m = lif_decay_32(m) + s_pool3[och][y][x] - r * vth;
-                    uint8_t s = (m >= vth) ? 1 : 0;
-                    s_mem3[och][y][x] = m;
-                    s_spk3[och][y][x] = s;
-                    total_spks_l3 += s;
+                    m = lif_decay_32(m) + pool_val - r * vth;
+                    if (m >= vth) {
+                        int idx = (och * POOL3_OUT_H + py) * POOL3_OUT_W + px;
+                        spk_set(s_spk3, idx);
+                        total_spks_l3++;
+                    }
+                    s_mem3[och][py][px] = m;
                 }
             }
         }
 
-        /* --- CAMADA 4: Head Linear (FC_IN_FEATURES -> FC_OUT_FEATURES) Orientada a Spikes ---
-         * Itera sobre os FC_IN_FEATURES neurônios de saída de spk3 (formato CHW: [32, 4, 4]).
-         * Apenas se o neurônio disparou spike (s==1), somamos os pesos correspondentes.
+        /* --- CAMADA 4: Head Linear (FC_IN_FEATURES -> FC_OUT_FEATURES) com Bit-Packing ---
+         * Itera palavra a palavra sobre s_spk3, pulando blocos de 32 neurônios silenciosos.
          */
         int32_t cur4[FC_OUT_FEATURES];
         for (int c = 0; c < FC_OUT_FEATURES; ++c) {
             cur4[c] = fc_bias[c];
         }
 
-        int idx = 0;
-        for (int ch = 0; ch < CONV3_OUT_CHANNELS; ++ch) {
-            for (int y = 0; y < 4; ++y) {
-                for (int x = 0; x < 4; ++x) {
-                    if (s_spk3[ch][y][x]) {
-                        for (int c = 0; c < FC_OUT_FEATURES; ++c) {
-                            cur4[c] += (int32_t)fc_weights[c * FC_IN_FEATURES + idx];
-                        }
-                        active_sops += FC_OUT_FEATURES;
-                    }
-                    idx++;
+        for (int word_idx = 0; word_idx < L3_SPK_WORDS; ++word_idx) {
+            uint32_t mask = s_spk3[word_idx];
+            if (mask == 0) continue;
+
+            while (mask) {
+                int bit = __builtin_ctz(mask);
+                mask &= (mask - 1);
+                int idx = (word_idx << 5) + bit;
+
+                for (int c = 0; c < FC_OUT_FEATURES; ++c) {
+                    cur4[c] += (int32_t)fc_weights[c * FC_IN_FEATURES + idx];
                 }
+                active_sops += FC_OUT_FEATURES;
             }
         }
 
