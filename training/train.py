@@ -128,6 +128,31 @@ def set_seed(seed: int = 42):
         torch.backends.cudnn.benchmark = False
 
 
+def build_loss_fn(loss_type: str) -> nn.Module:
+    """Constrói a função de perda temporal SNN a partir do identificador."""
+    if loss_type == "ce_rate":
+        return SF.ce_rate_loss()
+    if loss_type == "ce_mem":
+        mem_loss_cls = getattr(SF, "ce_mem_loss", SF.ce_max_membrane_loss)
+        return mem_loss_cls()
+    if loss_type == "mse_count":
+        return SF.mse_count_loss(correct_rate=0.8, incorrect_rate=0.2)
+    raise ValueError(f"Função de perda desconhecida: {loss_type}")
+
+
+def compute_temporal_loss(
+    criterion: nn.Module,
+    loss_type: str,
+    spk_out: torch.Tensor,
+    mem_out: torch.Tensor,
+    targets: torch.Tensor,
+) -> torch.Tensor:
+    """Aplica a loss temporal selecionada sobre spikes ou potenciais de membrana."""
+    if loss_type == "ce_mem":
+        return criterion(mem_out, targets)
+    return criterion(spk_out, targets)
+
+
 def train_one_epoch(
     model: nn.Module,
     train_loader: torch.utils.data.DataLoader,
@@ -136,6 +161,9 @@ def train_one_epoch(
     device: torch.device,
     num_steps: int,
     encoding: str,
+    loss_type: str = "ce_rate",
+    sparsity_weight: float = 0.0,
+    target_rate: Optional[float] = None,
     progress_bar: bool = True,
 ) -> Tuple[float, float, float]:
     """
@@ -163,8 +191,10 @@ def train_one_epoch(
             images, num_steps=num_steps, encoding=encoding, return_sparsity=True
         )
 
-        # Loss calculada sobre a taxa/contagem de spikes emitidos
-        loss = criterion(spk_out, targets)
+        # Loss temporal + regularização opcional de esparsidade nas camadas ocultas
+        loss = compute_temporal_loss(criterion, loss_type, spk_out, mem_out, targets)
+        if sparsity_weight > 0.0:
+            loss = loss + sparsity_weight * model.compute_firing_rate_loss(target_rate=target_rate)
         loss.backward()
         optimizer.step()
 
@@ -197,6 +227,7 @@ def evaluate(
     device: torch.device,
     num_steps: int,
     encoding: str,
+    loss_type: str = "ce_rate",
     progress_bar: bool = False,
     num_classes: Optional[int] = None,
 ) -> Dict[str, Any]:
@@ -236,7 +267,7 @@ def evaluate(
                 images, num_steps=num_steps, encoding=encoding, return_sparsity=True
             )
 
-            loss = criterion(spk_out, targets)
+            loss = compute_temporal_loss(criterion, loss_type, spk_out, mem_out, targets)
             total_loss += loss.item() * targets.size(0)
 
             # Predição por contagem temporal de spikes
@@ -293,9 +324,28 @@ def parse_args():
     parser.add_argument(
         "--encoding",
         type=str,
-        default="rate",
+        default="direct",
         choices=["rate", "direct"],
-        help="Método de codificação de entrada ('rate' ou 'direct')",
+        help="Método de codificação de entrada ('direct' padrão ou 'rate')",
+    )
+    parser.add_argument(
+        "--loss",
+        type=str,
+        default="ce_rate",
+        choices=["ce_rate", "ce_mem", "mse_count"],
+        help="Função de perda temporal SNN ('ce_rate', 'ce_mem' ou 'mse_count')",
+    )
+    parser.add_argument(
+        "--sparsity-weight",
+        type=float,
+        default=0.0,
+        help="Peso da regularização de esparsidade (firing rate) nas camadas ocultas",
+    )
+    parser.add_argument(
+        "--target-rate",
+        type=float,
+        default=None,
+        help="Taxa de disparo alvo opcional para regularização L1 (se omitido, penaliza L1 em direção a 0)",
     )
     parser.add_argument("--in-channels", type=int, default=3, choices=[1, 3], help="Canais de entrada: 3 (RGB) ou 1 (Cinza)")
     parser.add_argument("--num-classes", type=int, default=10, help="Número de classes (10 para CIFAR-10 completo, 2 para binário)")
@@ -380,14 +430,18 @@ def main():
     # 3. Otimizador e Função de Perda SNN
     optimizer = optim.Adam(model.parameters(), lr=args.lr, weight_decay=1e-5)
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs, eta_min=1e-5)
-    criterion = SF.ce_rate_loss()
+    criterion = build_loss_fn(args.loss)
 
     best_acc = 0.0
     best_checkpoint_path = os.path.join(args.save_dir, "best_spikevision_csnn.pth")
     history = []
 
     print("\nIniciando treinamento SNN:")
-    print(f"Épocas: {args.epochs} | Classes: {args.num_classes} | Timesteps (T): {args.num_steps} | Codificação: {args.encoding} | Beta LIF: {args.beta}\n")
+    print(
+        f"Épocas: {args.epochs} | Classes: {args.num_classes} | Timesteps (T): {args.num_steps} | "
+        f"Codificação: {args.encoding} | Loss: {args.loss} | "
+        f"Sparsity Weight: {args.sparsity_weight} | Beta LIF: {args.beta}\n"
+    )
 
     start_total_time = time.time()
 
@@ -402,6 +456,9 @@ def main():
             device=device,
             num_steps=args.num_steps,
             encoding=args.encoding,
+            loss_type=args.loss,
+            sparsity_weight=args.sparsity_weight,
+            target_rate=args.target_rate,
             progress_bar=not args.smoke_test,
         )
 
@@ -412,6 +469,7 @@ def main():
             device=device,
             num_steps=args.num_steps,
             encoding=args.encoding,
+            loss_type=args.loss,
             progress_bar=False,
             num_classes=args.num_classes,
         )
@@ -426,10 +484,11 @@ def main():
         macro_r = test_metrics.get("macro_recall", 0.0)
         overall_fr = test_metrics["overall_firing_rate"]
         sparsity = test_metrics["overall_sparsity"]
+        train_sparsity = 1.0 - train_firing_rate
 
         print(
             f"Época [{epoch:02d}/{args.epochs:02d}] ({epoch_time:.1f}s) | "
-            f"Treino Loss: {train_loss:.4f} Acc: {train_acc*100:5.2f}% | "
+            f"Treino Loss: {train_loss:.4f} Acc: {train_acc*100:5.2f}% Esp: {train_sparsity*100:5.1f}% | "
             f"Teste Loss: {test_loss:.4f} Acc: {test_acc*100:5.2f}% | "
             f"Macro-F1: {macro_f1:.3f} (P: {macro_p:.2f}, R: {macro_r:.2f}) | "
             f"Esparsidade: {sparsity*100:5.1f}% (Firing: {overall_fr*100:4.1f}%)"
@@ -440,6 +499,7 @@ def main():
             "train_loss": train_loss,
             "train_acc": train_acc,
             "train_firing_rate": train_firing_rate,
+            "train_sparsity": train_sparsity,
             "test_loss": test_loss,
             "test_acc": test_acc,
             "test_macro_f1": macro_f1,
@@ -447,6 +507,7 @@ def main():
             "test_macro_recall": macro_r,
             "test_per_class_f1": test_metrics.get("per_class_f1", {}),
             "test_per_class_accuracy": test_metrics.get("per_class_accuracy", {}),
+            "test_firing_rate": overall_fr,
             "test_sparsity": sparsity,
             "epoch_time_sec": epoch_time,
         }
@@ -467,6 +528,9 @@ def main():
                     "slope": 25.0,
                     "num_steps": args.num_steps,
                     "encoding": args.encoding,
+                    "loss_type": args.loss,
+                    "sparsity_weight": args.sparsity_weight,
+                    "target_rate": args.target_rate,
                 },
                 "metrics": test_metrics,
             }
