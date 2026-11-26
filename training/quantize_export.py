@@ -176,13 +176,39 @@ class BitAccurateInt8CSNN:
             return t.view(1, -1)
         return t
 
-    def __init__(self, quant_params: Dict[str, Dict[str, Any]], num_steps: int = 8):
+    @staticmethod
+    def _build_sop_kernel_mask(h: int, w: int) -> torch.Tensor:
+        """Mapa [1, 1, H, W] com contagem de posições válidas do kernel 3x3 (padding=1) por pixel."""
+        ky = torch.full((h,), 3, dtype=torch.int32)
+        ky[0] = 2
+        ky[-1] = 2
+        kx = torch.full((w,), 3, dtype=torch.int32)
+        kx[0] = 2
+        kx[-1] = 2
+        return (ky.view(h, 1) * kx.view(1, w)).view(1, 1, h, w)
+
+    def __init__(
+        self,
+        quant_params: Dict[str, Dict[str, Any]],
+        num_steps: int = 8,
+        early_exit_enabled: bool = False,
+        early_exit_min_t: int = 2,
+        early_exit_margin: int = 0,
+    ):
         self.p1 = quant_params["layer1"]
         self.p2 = quant_params["layer2"]
         self.p3 = quant_params["layer3"]
         self.p4 = quant_params["layer4"]
         self.num_steps = num_steps
         self.num_classes = self.p4["w_q"].shape[0]
+        self.early_exit_enabled = bool(early_exit_enabled)
+        self.early_exit_min_t = max(1, int(early_exit_min_t))
+        self.early_exit_margin = int(early_exit_margin)
+
+        self._k_weight_16 = self._build_sop_kernel_mask(16, 16)
+        self._k_weight_8 = self._build_sop_kernel_mask(8, 8)
+        self.last_timesteps_executed = None
+        self.last_sample_sops = None
 
         # Tensores para convolução acelerada via PyTorch com aritmética exata inteira
         self.w1_t = self.p1["w_q"].float()
@@ -232,17 +258,29 @@ class BitAccurateInt8CSNN:
         p1 = F.max_pool2d(c1, 2).to(torch.int32)
 
         spk_counts = torch.zeros((B, self.num_classes), dtype=torch.int32)
+        final_mem_out = torch.zeros((B, self.num_classes), dtype=torch.int32)
+        active = torch.ones(B, dtype=torch.bool)
+        timesteps_executed = torch.full((B,), self.num_steps, dtype=torch.int32)
+        sample_sops = torch.zeros(B, dtype=torch.int64)
+
         total_spks_l1 = 0
         total_spks_l2 = 0
         total_spks_l3 = 0
         total_spks_l4 = 0
 
         for t in range(self.num_steps):
+            if not active.any():
+                break
+
+            active_i = active.to(torch.int32)
+            active_i4d = active_i.view(B, 1, 1, 1)
+            active_l = active.to(torch.int64)
+
             # --- Camada 1 ---
             r1 = (mem1 >= self.vth1).to(torch.int32)
             mem1 = ((mem1 * BETA_NUM) >> BETA_SHIFT) + p1 - r1 * self.vth1
             s1 = (mem1 >= self.vth1).to(torch.int32)
-            total_spks_l1 += s1.sum().item()
+            total_spks_l1 += int((s1 * active_i4d).sum().item())
 
             # --- Camada 2 ---
             c2 = F.conv2d(s1.float(), self.w2_t, self.b2_t, padding=1)
@@ -250,7 +288,8 @@ class BitAccurateInt8CSNN:
             r2 = (mem2 >= self.vth2).to(torch.int32)
             mem2 = ((mem2 * BETA_NUM) >> BETA_SHIFT) + p2 - r2 * self.vth2
             s2 = (mem2 >= self.vth2).to(torch.int32)
-            total_spks_l2 += s2.sum().item()
+            total_spks_l2 += int((s2 * active_i4d).sum().item())
+            sample_sops += (s1 * self._k_weight_16).sum(dim=(1, 2, 3)).to(torch.int64) * 32 * active_l
 
             # --- Camada 3 ---
             c3 = F.conv2d(s2.float(), self.w3_t, self.b3_t, padding=1)
@@ -258,7 +297,8 @@ class BitAccurateInt8CSNN:
             r3 = (mem3 >= self.vth3).to(torch.int32)
             mem3 = ((mem3 * BETA_NUM) >> BETA_SHIFT) + p3 - r3 * self.vth3
             s3 = (mem3 >= self.vth3).to(torch.int32)
-            total_spks_l3 += s3.sum().item()
+            total_spks_l3 += int((s3 * active_i4d).sum().item())
+            sample_sops += (s2 * self._k_weight_8).sum(dim=(1, 2, 3)).to(torch.int64) * 32 * active_l
 
             # --- Camada 4 (Head Linear) ---
             flat = s3.flatten(start_dim=1).float()
@@ -266,9 +306,35 @@ class BitAccurateInt8CSNN:
             r4 = (mem4 >= self.vth4).to(torch.int32)
             mem4 = ((mem4 * BETA_NUM) >> BETA_SHIFT) + cur4 - r4 * self.vth4
             s4 = (mem4 >= self.vth4).to(torch.int32)
-            total_spks_l4 += s4.sum().item()
+            total_spks_l4 += int((s4 * active_i.view(B, 1)).sum().item())
+            sample_sops += s3.sum(dim=(1, 2, 3)).to(torch.int64) * self.num_classes * active_l
 
-            spk_counts += s4
+            spk_counts += s4 * active_i.view(B, 1)
+
+            # --- Critério de Early-Exit Temporal ---
+            timesteps_done = t + 1
+            remaining = self.num_steps - timesteps_done
+            if self.early_exit_enabled and remaining > 0 and timesteps_done >= self.early_exit_min_t:
+                if self.num_classes > 1:
+                    top2 = torch.topk(spk_counts, k=2, dim=1).values
+                    gap = top2[:, 0] - top2[:, 1]
+                else:
+                    gap = spk_counts[:, 0]
+                if self.early_exit_margin > 0:
+                    cond = gap >= self.early_exit_margin
+                else:
+                    cond = gap > remaining
+                exit_now = active & cond
+                if exit_now.any():
+                    timesteps_executed[exit_now] = timesteps_done
+                    final_mem_out[exit_now] = mem4[exit_now]
+                    active[exit_now] = False
+
+        if active.any():
+            final_mem_out[active] = mem4[active]
+
+        self.last_timesteps_executed = timesteps_executed
+        self.last_sample_sops = sample_sops
 
         # Regra de decisão multi-classe idêntica à do C++ (maior contagem de spikes;
         # desempate pelo maior potencial final de membrana mem4)
@@ -276,23 +342,25 @@ class BitAccurateInt8CSNN:
         for b in range(B):
             best_c = 0
             max_spk = spk_counts[b, 0].item()
-            best_mem = mem4[b, 0].item()
+            best_mem = final_mem_out[b, 0].item()
             for c in range(1, self.num_classes):
                 s = spk_counts[b, c].item()
-                m = mem4[b, c].item()
+                m = final_mem_out[b, c].item()
                 if s > max_spk or (s == max_spk and m > best_mem):
                     max_spk = s
                     best_mem = m
                     best_c = c
             preds[b] = best_c
 
-        # Estatísticas de esparsidade
-        n_l1 = self.num_steps * B * (16 * 16 * 16)
-        n_l2 = self.num_steps * B * (32 * 8 * 8)
-        n_l3 = self.num_steps * B * (32 * 4 * 4)
-        n_l4 = self.num_steps * B * self.num_classes
+        # Estatísticas de esparsidade e execução adaptativa
+        total_t = int(timesteps_executed.sum().item())
+        n_l1 = total_t * (16 * 16 * 16)
+        n_l2 = total_t * (32 * 8 * 8)
+        n_l3 = total_t * (32 * 4 * 4)
+        n_l4 = total_t * self.num_classes
         total_neurons = n_l1 + n_l2 + n_l3 + n_l4
         total_spks = total_spks_l1 + total_spks_l2 + total_spks_l3 + total_spks_l4
+        avg_t = float(timesteps_executed.float().mean().item())
 
         sparsity_metrics = {
             "firing_rate_l1": total_spks_l1 / max(n_l1, 1),
@@ -301,9 +369,12 @@ class BitAccurateInt8CSNN:
             "firing_rate_l4": total_spks_l4 / max(n_l4, 1),
             "overall_firing_rate": total_spks / max(total_neurons, 1),
             "overall_sparsity": 1.0 - (total_spks / max(total_neurons, 1)),
+            "avg_timesteps": avg_t,
+            "timestep_reduction_percent": 100.0 * (1.0 - avg_t / max(self.num_steps, 1)),
+            "avg_sops": float(sample_sops.float().mean().item()),
         }
 
-        return preds, spk_counts, mem4, sparsity_metrics
+        return preds, spk_counts, final_mem_out, sparsity_metrics
 
     def forward_single(
         self, img: torch.Tensor
@@ -949,6 +1020,23 @@ def main():
         action="store_true",
         help="Força exportação mesmo se o checkpoint não tiver sido treinado com encoding='direct'",
     )
+    parser.add_argument(
+        "--early-exit",
+        action="store_true",
+        help="Executa avaliação comparativa de Early-Exit Temporal (full-T vs adaptativo)",
+    )
+    parser.add_argument(
+        "--early-exit-min-t",
+        type=int,
+        default=2,
+        help="Número mínimo de timesteps antes de avaliar early-exit (padrão: 2)",
+    )
+    parser.add_argument(
+        "--early-exit-margin",
+        type=int,
+        default=0,
+        help="Margem de spikes (top1 - top2) para early-exit; 0 ativa modo lossless matemático",
+    )
     args = parser.parse_args()
 
     print("\n" + "=" * 70)
@@ -1113,6 +1201,67 @@ def main():
     samples_per_cls = 1 if num_classes == 10 else args.test_samples_per_class
     export_test_samples_h(test_loader, int8_sim, args.output_samples, samples_per_class=samples_per_cls)
 
+    # 9.5 Avaliação opcional de Early-Exit Temporal
+    early_exit_summary = None
+    if args.early_exit:
+        num_steps = config.get("num_steps", 8)
+        ee_sim = BitAccurateInt8CSNN(
+            quant_params,
+            num_steps=num_steps,
+            early_exit_enabled=True,
+            early_exit_min_t=args.early_exit_min_t,
+            early_exit_margin=args.early_exit_margin,
+        )
+        full_preds, ee_preds, ee_targets = [], [], []
+        full_sops_total = 0
+        ee_sops_total = 0
+        ee_t_total = 0
+        total_samples = 0
+
+        for imgs, targets in test_loader:
+            imgs_cpu = imgs.cpu()
+            p_full, _, _, _ = int8_sim.forward_batch(imgs_cpu)
+            p_ee, _, _, _ = ee_sim.forward_batch(imgs_cpu)
+            full_preds.append(p_full)
+            ee_preds.append(p_ee)
+            ee_targets.append(targets.cpu())
+            full_sops_total += int(int8_sim.last_sample_sops.sum().item())
+            ee_sops_total += int(ee_sim.last_sample_sops.sum().item())
+            ee_t_total += int(ee_sim.last_timesteps_executed.sum().item())
+            total_samples += imgs_cpu.size(0)
+
+        full_preds_np = torch.cat(full_preds).numpy()
+        ee_preds_np = torch.cat(ee_preds).numpy()
+        ee_targets_np = torch.cat(ee_targets).numpy()
+
+        avg_t = ee_t_total / max(total_samples, 1)
+        t_red_pct = 100.0 * (1.0 - avg_t / max(num_steps, 1))
+        sop_red_pct = 100.0 * (1.0 - ee_sops_total / max(full_sops_total, 1))
+        ee_agreement = float(np.mean(full_preds_np == ee_preds_np))
+        ee_accuracy = float(np.mean(ee_preds_np == ee_targets_np))
+
+        early_exit_summary = {
+            "enabled": True,
+            "min_timesteps": max(1, args.early_exit_min_t),
+            "margin": args.early_exit_margin,
+            "mode": "lossless" if args.early_exit_margin <= 0 else f"margin>={args.early_exit_margin}",
+            "avg_timesteps": avg_t,
+            "max_timesteps": num_steps,
+            "timestep_reduction_percent": t_red_pct,
+            "full_t_avg_sops": full_sops_total / max(total_samples, 1),
+            "early_exit_avg_sops": ee_sops_total / max(total_samples, 1),
+            "sop_reduction_percent": sop_red_pct,
+            "agreement_with_full_t": ee_agreement,
+            "accuracy": ee_accuracy,
+        }
+
+        print("⚡ AVALIAÇÃO EARLY-EXIT TEMPORAL (Full-T vs Adaptativo):")
+        print(f"  • Modo:                    {early_exit_summary['mode']} (min_t={early_exit_summary['min_timesteps']})")
+        print(f"  • t_exit médio:            {avg_t:.2f} / {num_steps} (Economia de {t_red_pct:.2f}% timesteps)")
+        print(f"  • SOPs médias:             {early_exit_summary['early_exit_avg_sops']:.0f} vs {early_exit_summary['full_t_avg_sops']:.0f} (Economia de {sop_red_pct:.2f}%)")
+        print(f"  • Concordância vs Full-T:  {ee_agreement*100:.2f}%")
+        print(f"  • Acurácia Early-Exit:     {ee_accuracy*100:.2f}%\n")
+
     # 10. Salvar Relatório em JSON
     report = {
         "model_architecture": "SpikeVisionCSNN",
@@ -1149,6 +1298,8 @@ def main():
         "agreement_rate": agreement,
         "memory_analysis": mem_analysis,
     }
+    if early_exit_summary is not None:
+        report["early_exit"] = early_exit_summary
 
     os.makedirs(os.path.dirname(args.output_report), exist_ok=True)
     with open(args.output_report, "w", encoding="utf-8") as f:

@@ -168,12 +168,83 @@ static int run_validation_suite(void) {
     }
 }
 
+static int run_early_exit_benchmark(void) {
+    struct EarlyExitMode {
+        const char* label;
+        snn_early_exit_cfg_t cfg;
+        bool require_lossless;
+    };
+
+    const EarlyExitMode modes[] = {
+        { "Lossless (margin=0, min_t=2)",   { true, 2, 0 }, true },
+        { "Agressivo (margin=2, min_t=2)",  { true, 2, 2 }, false },
+    };
+
+    /* Baseline full-T SOPs para cálculo exato de economia */
+    uint64_t baseline_sops = 0;
+    for (int i = 0; i < TEST_SAMPLE_COUNT; i++) {
+        SNNInferenceResult base_res;
+        snn_engine_infer(TEST_SUITE[i].image_data, &base_res);
+        baseline_sops += base_res.active_sops;
+    }
+
+    printf("⚡ [Benchmark de Early-Exit Temporal Adaptativo (%d Amostras)]:\n", TEST_SAMPLE_COUNT);
+    printf("--------------------------------------------------------------------------------------------------------------\n");
+    printf("| Modo                          | t_exit Médio | Econ. Timesteps | Econ. SOPs | Latência Média | Concordância |\n");
+    printf("--------------------------------------------------------------------------------------------------------------\n");
+
+    int status = 0;
+    for (size_t m = 0; m < sizeof(modes) / sizeof(modes[0]); m++) {
+        uint64_t total_t = 0;
+        uint64_t total_sops = 0;
+        uint64_t total_lat_us = 0;
+        int agreements = 0;
+
+        for (int i = 0; i < TEST_SAMPLE_COUNT; i++) {
+            const SNNTestCase* tc = &TEST_SUITE[i];
+            SNNInferenceResult res;
+            snn_engine_infer_adaptive(tc->image_data, &res, &modes[m].cfg);
+
+            total_t += (uint64_t)res.timesteps_executed;
+            total_sops += res.active_sops;
+            total_lat_us += res.latency_us;
+            if (res.predicted_class == tc->expected_prediction) {
+                agreements++;
+            }
+        }
+
+        float avg_t = (float)total_t / (float)TEST_SAMPLE_COUNT;
+        float t_saving = 100.0f * (1.0f - (avg_t / (float)SPIKEVISION_TIMESTEPS));
+        float sop_saving = (baseline_sops > 0)
+            ? 100.0f * (1.0f - ((float)total_sops / (float)baseline_sops))
+            : 0.0f;
+        float avg_lat_ms = ((float)total_lat_us / (float)TEST_SAMPLE_COUNT) / 1000.0f;
+        float agreement_pct = 100.0f * ((float)agreements / (float)TEST_SAMPLE_COUNT);
+
+        printf("| %-29s | %5.2f / %d    |     %6.2f%%     |   %6.2f%%  |    %6.2f ms   |    %6.2f%%   |\n",
+               modes[m].label,
+               avg_t,
+               SPIKEVISION_TIMESTEPS,
+               t_saving,
+               sop_saving,
+               avg_lat_ms,
+               agreement_pct);
+
+        if (modes[m].require_lossless && agreements != TEST_SAMPLE_COUNT) {
+            status = 1;
+        }
+    }
+    printf("--------------------------------------------------------------------------------------------------------------\n\n");
+    return status;
+}
+
 #if defined(ESP_PLATFORM)
 extern "C" void app_main(void) {
     print_banner();
     print_system_info();
     snn_engine_init();
     run_validation_suite();
+    run_early_exit_benchmark();
 
     ESP_LOGI(TAG, "SpikeVision-S3 Neuromorphic Engine executado com sucesso.");
     vTaskDelay(pdMS_TO_TICKS(1000));
@@ -185,6 +256,8 @@ int main(int argc, char** argv) {
     print_banner();
     print_system_info();
     snn_engine_init();
-    return run_validation_suite();
+    int rc = run_validation_suite();
+    int ee_rc = run_early_exit_benchmark();
+    return (rc != 0 || ee_rc != 0) ? 1 : 0;
 }
 #endif
