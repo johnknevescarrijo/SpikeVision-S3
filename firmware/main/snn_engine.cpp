@@ -56,6 +56,42 @@ static inline int32_t lif_decay_32(int32_t mem) {
     return prod >> SPIKEVISION_BETA_SHIFT;
 }
 
+static inline int32_t vth_l1(int c) {
+#ifdef SPIKEVISION_PER_CHANNEL_QUANT
+    return VTH_L1_CH[c];
+#else
+    (void)c;
+    return SPIKEVISION_L1_VTH;
+#endif
+}
+
+static inline int32_t vth_l2(int c) {
+#ifdef SPIKEVISION_PER_CHANNEL_QUANT
+    return VTH_L2_CH[c];
+#else
+    (void)c;
+    return SPIKEVISION_L2_VTH;
+#endif
+}
+
+static inline int32_t vth_l3(int c) {
+#ifdef SPIKEVISION_PER_CHANNEL_QUANT
+    return VTH_L3_CH[c];
+#else
+    (void)c;
+    return SPIKEVISION_L3_VTH;
+#endif
+}
+
+static inline int32_t vth_fc(int c) {
+#ifdef SPIKEVISION_PER_CHANNEL_QUANT
+    return VTH_FC_CH[c];
+#else
+    (void)c;
+    return SPIKEVISION_L4_VTH;
+#endif
+}
+
 /* =========================================================================
  * API do Motor Neuromórfico
  * ========================================================================= */
@@ -162,12 +198,13 @@ void snn_engine_infer(const uint8_t* image_chw, SNNInferenceResult* result) {
 
         /* --- CAMADA 1: Leaky LIF (16 x 16 x 16) --- */
         for (int och = 0; och < CONV1_OUT_CHANNELS; och++) {
+            int32_t vth = vth_l1(och);
             for (int y = 0; y < POOL1_OUT_H; y++) {
                 for (int x = 0; x < POOL1_OUT_W; x++) {
                     int32_t m = s_mem1[och][y][x];
-                    int32_t r = (m >= SPIKEVISION_L1_VTH) ? 1 : 0;
-                    m = lif_decay_32(m) + s_pool1[och][y][x] - r * SPIKEVISION_L1_VTH;
-                    uint8_t s = (m >= SPIKEVISION_L1_VTH) ? 1 : 0;
+                    int32_t r = (m >= vth) ? 1 : 0;
+                    m = lif_decay_32(m) + s_pool1[och][y][x] - r * vth;
+                    uint8_t s = (m >= vth) ? 1 : 0;
                     s_mem1[och][y][x] = m;
                     s_spk1[och][y][x] = s;
                     total_spks_l1 += s;
@@ -228,12 +265,13 @@ void snn_engine_infer(const uint8_t* image_chw, SNNInferenceResult* result) {
 
         /* Camada 2: Leaky LIF (32 x 8 x 8) */
         for (int och = 0; och < CONV2_OUT_CHANNELS; och++) {
+            int32_t vth = vth_l2(och);
             for (int y = 0; y < POOL2_OUT_H; y++) {
                 for (int x = 0; x < POOL2_OUT_W; x++) {
                     int32_t m = s_mem2[och][y][x];
-                    int32_t r = (m >= SPIKEVISION_L2_VTH) ? 1 : 0;
-                    m = lif_decay_32(m) + s_pool2[och][y][x] - r * SPIKEVISION_L2_VTH;
-                    uint8_t s = (m >= SPIKEVISION_L2_VTH) ? 1 : 0;
+                    int32_t r = (m >= vth) ? 1 : 0;
+                    m = lif_decay_32(m) + s_pool2[och][y][x] - r * vth;
+                    uint8_t s = (m >= vth) ? 1 : 0;
                     s_mem2[och][y][x] = m;
                     s_spk2[och][y][x] = s;
                     total_spks_l2 += s;
@@ -291,12 +329,13 @@ void snn_engine_infer(const uint8_t* image_chw, SNNInferenceResult* result) {
 
         /* Camada 3: Leaky LIF (32 x 4 x 4) */
         for (int och = 0; och < CONV3_OUT_CHANNELS; och++) {
+            int32_t vth = vth_l3(och);
             for (int y = 0; y < POOL3_OUT_H; y++) {
                 for (int x = 0; x < POOL3_OUT_W; x++) {
                     int32_t m = s_mem3[och][y][x];
-                    int32_t r = (m >= SPIKEVISION_L3_VTH) ? 1 : 0;
-                    m = lif_decay_32(m) + s_pool3[och][y][x] - r * SPIKEVISION_L3_VTH;
-                    uint8_t s = (m >= SPIKEVISION_L3_VTH) ? 1 : 0;
+                    int32_t r = (m >= vth) ? 1 : 0;
+                    m = lif_decay_32(m) + s_pool3[och][y][x] - r * vth;
+                    uint8_t s = (m >= vth) ? 1 : 0;
                     s_mem3[och][y][x] = m;
                     s_spk3[och][y][x] = s;
                     total_spks_l3 += s;
@@ -330,10 +369,11 @@ void snn_engine_infer(const uint8_t* image_chw, SNNInferenceResult* result) {
 
         /* Camada 4: Leaky LIF (FC_OUT_FEATURES Classes) */
         for (int c = 0; c < FC_OUT_FEATURES; c++) {
+            int32_t vth = vth_fc(c);
             int32_t m = s_mem4[c];
-            int32_t r = (m >= SPIKEVISION_L4_VTH) ? 1 : 0;
-            m = lif_decay_32(m) + cur4[c] - r * SPIKEVISION_L4_VTH;
-            uint8_t s = (m >= SPIKEVISION_L4_VTH) ? 1 : 0;
+            int32_t r = (m >= vth) ? 1 : 0;
+            m = lif_decay_32(m) + cur4[c] - r * vth;
+            uint8_t s = (m >= vth) ? 1 : 0;
             s_mem4[c] = m;
             s_spk_counts[c] += s;
             total_spks_l4 += s;

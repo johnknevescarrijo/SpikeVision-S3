@@ -39,6 +39,7 @@ from typing import Tuple, Optional, Callable, Dict, Any, Union
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader
 import torchvision
@@ -69,6 +70,8 @@ CONFIG = {
     "loss_type": "ce_rate",  # 'ce_rate', 'ce_mem' ou 'mse_count'
     "sparsity_weight": 0.0,  # Peso da regularização de esparsidade (firing rate)
     "target_rate": None,     # Taxa alvo opcional (None = L1 em direção a 0)
+    "qat": False,            # Quantization-Aware Training (STE Int8)
+    "qat_per_channel": True, # True = per-channel (axis=0), False = per-tensor
     "in_channels": 3,        # 3 para RGB (ou 1 para escala de cinza)
     "num_classes": 10,       # 10 classes completas do CIFAR-10
 
@@ -303,6 +306,45 @@ def get_dataloaders(
 
 
 # ==============================================================================
+# QAT (QUANTIZATION-AWARE TRAINING) COM STE INT8
+# ==============================================================================
+def fake_quantize_int8_ste(weight: torch.Tensor, per_channel: bool = True) -> torch.Tensor:
+    """Fake quantization simétrica Int8 [-127, 127] com STE no backward."""
+    if per_channel:
+        w_flat = weight.detach().reshape(weight.shape[0], -1)
+        w_max = w_flat.abs().max(dim=1).values
+        s_w = torch.where(w_max < 1e-8, torch.ones_like(w_max), 127.0 / w_max)
+        s_w = s_w.view(-1, *([1] * (weight.dim() - 1)))
+    else:
+        w_max = weight.detach().abs().max()
+        s_w = torch.where(w_max < 1e-8, torch.ones_like(w_max), 127.0 / w_max)
+    w_q = torch.clamp(torch.round(weight * s_w), -127.0, 127.0) / s_w
+    return weight + (w_q - weight).detach()
+
+
+class QATConv2d(nn.Conv2d):
+    def __init__(self, *args, per_channel: bool = True, qat_enabled: bool = True, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.per_channel = per_channel
+        self.qat_enabled = qat_enabled
+
+    def forward(self, input: torch.Tensor) -> torch.Tensor:
+        w = fake_quantize_int8_ste(self.weight, per_channel=self.per_channel) if self.qat_enabled else self.weight
+        return self._conv_forward(input, w, self.bias)
+
+
+class QATLinear(nn.Linear):
+    def __init__(self, *args, per_channel: bool = True, qat_enabled: bool = True, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.per_channel = per_channel
+        self.qat_enabled = qat_enabled
+
+    def forward(self, input: torch.Tensor) -> torch.Tensor:
+        w = fake_quantize_int8_ste(self.weight, per_channel=self.per_channel) if self.qat_enabled else self.weight
+        return F.linear(input, w, self.bias)
+
+
+# ==============================================================================
 # MODELO: SPIKEVISION CONVOLUTIONAL SNN (CSNN) PARA ESP32-S3
 # ==============================================================================
 class SpikeVisionCSNN(nn.Module):
@@ -317,35 +359,47 @@ class SpikeVisionCSNN(nn.Module):
         num_classes: int = 10,
         beta: float = 0.9,
         slope: float = 25.0,
+        qat: bool = False,
+        qat_per_channel: bool = True,
     ):
         super().__init__()
         self.in_channels = in_channels
         self.num_classes = num_classes
         self.beta = beta
+        self.qat = qat
+        self.qat_per_channel = qat_per_channel
 
         spike_grad = surrogate.fast_sigmoid(slope=slope)
 
+        def make_conv(in_c: int, out_c: int) -> nn.Conv2d:
+            if qat:
+                return QATConv2d(in_c, out_c, kernel_size=3, padding=1, bias=False, per_channel=qat_per_channel)
+            return nn.Conv2d(in_c, out_c, kernel_size=3, padding=1, bias=False)
+
         # Camada 1: 32x32 -> MaxPool -> 16x16
-        self.conv1 = nn.Conv2d(in_channels, 16, kernel_size=3, padding=1, bias=False)
+        self.conv1 = make_conv(in_channels, 16)
         self.bn1 = nn.BatchNorm2d(16)
         self.pool1 = nn.MaxPool2d(2)
         self.lif1 = snn.Leaky(beta=beta, spike_grad=spike_grad, init_hidden=False)
 
         # Camada 2: 16x16 -> MaxPool -> 8x8
-        self.conv2 = nn.Conv2d(16, 32, kernel_size=3, padding=1, bias=False)
+        self.conv2 = make_conv(16, 32)
         self.bn2 = nn.BatchNorm2d(32)
         self.pool2 = nn.MaxPool2d(2)
         self.lif2 = snn.Leaky(beta=beta, spike_grad=spike_grad, init_hidden=False)
 
         # Camada 3: 8x8 -> MaxPool -> 4x4
-        self.conv3 = nn.Conv2d(32, 32, kernel_size=3, padding=1, bias=False)
+        self.conv3 = make_conv(32, 32)
         self.bn3 = nn.BatchNorm2d(32)
         self.pool3 = nn.MaxPool2d(2)
         self.lif3 = snn.Leaky(beta=beta, spike_grad=spike_grad, init_hidden=False)
 
-        # Classificador (Head): 32 * 4 * 4 = 512 neurônios -> 2 classes
+        # Classificador (Head): 32 * 4 * 4 = 512 neurônios -> num_classes
         self.flatten = nn.Flatten()
-        self.fc = nn.Linear(32 * 4 * 4, num_classes, bias=False)
+        if qat:
+            self.fc = QATLinear(32 * 4 * 4, num_classes, bias=False, per_channel=qat_per_channel)
+        else:
+            self.fc = nn.Linear(32 * 4 * 4, num_classes, bias=False)
         self.lif4 = snn.Leaky(beta=beta, spike_grad=spike_grad, init_hidden=False)
         self.last_hidden_spikes: Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = None
 
@@ -756,6 +810,8 @@ def main():
         num_classes=CONFIG["num_classes"],
         beta=CONFIG["beta"],
         slope=CONFIG["slope"],
+        qat=CONFIG["qat"],
+        qat_per_channel=CONFIG["qat_per_channel"],
     ).to(device)
 
     print_model_summary(model)
@@ -862,6 +918,8 @@ def main():
                     "loss_type": CONFIG["loss_type"],
                     "sparsity_weight": CONFIG["sparsity_weight"],
                     "target_rate": CONFIG["target_rate"],
+                    "qat": CONFIG["qat"],
+                    "qat_per_channel": CONFIG["qat_per_channel"],
                 },
                 "metrics": test_metrics,
             }

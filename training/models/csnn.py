@@ -14,6 +14,7 @@ import snntorch as snn
 from snntorch import surrogate
 
 from training.datasets.cifar10_cat import encode_spikes
+from training.models.qat import QATConv2d, QATLinear
 
 
 class SpikeVisionCSNN(nn.Module):
@@ -35,36 +36,48 @@ class SpikeVisionCSNN(nn.Module):
         num_classes: int = 10,
         beta: float = 0.9,
         slope: float = 25.0,
+        qat: bool = False,
+        qat_per_channel: bool = True,
     ):
         super().__init__()
         self.in_channels = in_channels
         self.num_classes = num_classes
         self.beta = beta
+        self.qat = qat
+        self.qat_per_channel = qat_per_channel
 
         # Gradiente substituto para BPTT
         spike_grad = surrogate.fast_sigmoid(slope=slope)
 
+        def make_conv(in_c: int, out_c: int) -> nn.Conv2d:
+            if qat:
+                return QATConv2d(in_c, out_c, kernel_size=3, padding=1, bias=False, per_channel=qat_per_channel)
+            return nn.Conv2d(in_c, out_c, kernel_size=3, padding=1, bias=False)
+
         # Camada 1: 32x32 -> MaxPool -> 16x16
-        self.conv1 = nn.Conv2d(in_channels, 16, kernel_size=3, padding=1, bias=False)
+        self.conv1 = make_conv(in_channels, 16)
         self.bn1 = nn.BatchNorm2d(16)
         self.pool1 = nn.MaxPool2d(2)
         self.lif1 = snn.Leaky(beta=beta, spike_grad=spike_grad, init_hidden=False)
 
         # Camada 2: 16x16 -> MaxPool -> 8x8
-        self.conv2 = nn.Conv2d(16, 32, kernel_size=3, padding=1, bias=False)
+        self.conv2 = make_conv(16, 32)
         self.bn2 = nn.BatchNorm2d(32)
         self.pool2 = nn.MaxPool2d(2)
         self.lif2 = snn.Leaky(beta=beta, spike_grad=spike_grad, init_hidden=False)
 
         # Camada 3: 8x8 -> MaxPool -> 4x4
-        self.conv3 = nn.Conv2d(32, 32, kernel_size=3, padding=1, bias=False)
+        self.conv3 = make_conv(32, 32)
         self.bn3 = nn.BatchNorm2d(32)
         self.pool3 = nn.MaxPool2d(2)
         self.lif3 = snn.Leaky(beta=beta, spike_grad=spike_grad, init_hidden=False)
 
-        # Classificador (Head): 32 * 4 * 4 = 512 neurônios -> 2 classes
+        # Classificador (Head): 32 * 4 * 4 = 512 neurônios -> num_classes
         self.flatten = nn.Flatten()
-        self.fc = nn.Linear(32 * 4 * 4, num_classes, bias=False)
+        if qat:
+            self.fc = QATLinear(32 * 4 * 4, num_classes, bias=False, per_channel=qat_per_channel)
+        else:
+            self.fc = nn.Linear(32 * 4 * 4, num_classes, bias=False)
         self.lif4 = snn.Leaky(beta=beta, spike_grad=spike_grad, init_hidden=False)
 
         # Armazena spikes das camadas ocultas do último forward para regularização de esparsidade

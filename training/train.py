@@ -354,6 +354,12 @@ def parse_args():
     parser.add_argument("--seed", type=int, default=42, help="Seed para reprodutibilidade")
     parser.add_argument("--num-workers", type=int, default=2, help="Workers do DataLoader")
     parser.add_argument("--no-download", action="store_true", help="Não baixar dataset CIFAR-10 se ausente")
+    parser.add_argument("--qat", action="store_true", help="Ativar Quantization-Aware Training (QAT) com STE Int8")
+    parser.add_argument(
+        "--qat-per-tensor",
+        action="store_true",
+        help="Quando --qat está ativo, usa quantização per-tensor ao invés de per-channel (axis=0)",
+    )
     parser.add_argument("--smoke-test", action="store_true", help="Executar teste rápido de sanidade do pipeline")
 
     return parser.parse_args()
@@ -417,11 +423,14 @@ def main():
     print(f"Amostras de Treino: {len(train_loader.dataset):,} | Amostras de Teste: {len(test_loader.dataset):,}")
 
     # 2. Inicializar Modelo
+    qat_per_channel = not args.qat_per_tensor
     model = SpikeVisionCSNN(
         in_channels=args.in_channels,
         num_classes=args.num_classes,
         beta=args.beta,
         slope=25.0,
+        qat=args.qat,
+        qat_per_channel=qat_per_channel,
     ).to(device)
 
     # Sumário da Arquitetura
@@ -437,10 +446,11 @@ def main():
     history = []
 
     print("\nIniciando treinamento SNN:")
+    qat_desc = f"Ativo ({'per-channel' if qat_per_channel else 'per-tensor'})" if args.qat else "Desativado"
     print(
         f"Épocas: {args.epochs} | Classes: {args.num_classes} | Timesteps (T): {args.num_steps} | "
         f"Codificação: {args.encoding} | Loss: {args.loss} | "
-        f"Sparsity Weight: {args.sparsity_weight} | Beta LIF: {args.beta}\n"
+        f"Sparsity Weight: {args.sparsity_weight} | Beta LIF: {args.beta} | QAT: {qat_desc}\n"
     )
 
     start_total_time = time.time()
@@ -531,6 +541,8 @@ def main():
                     "loss_type": args.loss,
                     "sparsity_weight": args.sparsity_weight,
                     "target_rate": args.target_rate,
+                    "qat": args.qat,
+                    "qat_per_channel": qat_per_channel,
                 },
                 "metrics": test_metrics,
             }
