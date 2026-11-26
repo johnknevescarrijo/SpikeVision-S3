@@ -77,21 +77,49 @@ def quantize_layer(
     b_fused: torch.Tensor,
     s_in: float,
     v_th: float = 1.0,
+    per_channel: bool = True,
 ) -> Dict[str, Any]:
     """
     Quantiza os parâmetros de uma camada para Int8 (pesos) e Int32 (bias e threshold).
-    
+
     Args:
-        w_fused: Pesos fundidos Float32.
-        b_fused: Biases fundidos Float32.
+        w_fused: Pesos fundidos Float32 [C_out, ...].
+        b_fused: Biases fundidos Float32 [C_out].
         s_in: Escala de entrada (127.0 para camada de pixels, 1.0 para spikes binários).
         v_th: Limiar de disparo Float32 (1.0).
-        
+        per_channel: Se True, quantiza simetricamente por canal de saída (axis=0).
+                     Se False, quantiza com uma única escala por tensor.
+
     Returns:
         Dicionário com tensores quantizados e parâmetros de escala.
     """
+    if per_channel:
+        w_flat = w_fused.reshape(w_fused.shape[0], -1)
+        w_max_ch = torch.max(torch.abs(w_flat), dim=1).values
+        s_w_ch = torch.where(w_max_ch < 1e-8, torch.ones_like(w_max_ch), 127.0 / w_max_ch)
+        s_w_view = s_w_ch.view(-1, *([1] * (w_fused.dim() - 1)))
+
+        w_q = torch.clamp(torch.round(w_fused * s_w_view), -127, 127).to(torch.int8)
+        s_total_ch = s_w_ch * s_in
+        b_q = torch.round(b_fused * s_total_ch).to(torch.int32)
+        vth_q = torch.round(torch.full_like(s_total_ch, v_th) * s_total_ch).to(torch.int32)
+
+        return {
+            "per_channel": True,
+            "w_fused": w_fused,
+            "b_fused": b_fused,
+            "w_q": w_q,
+            "b_q": b_q,
+            "w_max": w_max_ch,
+            "s_w": s_w_ch,
+            "s_in": s_in,
+            "s_total": s_total_ch,
+            "vth_q": vth_q,
+            "vth_float": v_th,
+        }
+
     w_max = float(torch.max(torch.abs(w_fused)).item())
-    if w_max == 0:
+    if w_max < 1e-8:
         s_w = 1.0
     else:
         s_w = 127.0 / w_max
@@ -106,6 +134,7 @@ def quantize_layer(
     vth_q = int(round(v_th * s_total))
 
     return {
+        "per_channel": False,
         "w_fused": w_fused,
         "b_fused": b_fused,
         "w_q": w_q,
@@ -131,6 +160,22 @@ class BitAccurateInt8CSNN:
     - Reset por subtração: mem = mem - reset * V_th.
     """
 
+    @staticmethod
+    def _prepare_vth(vth_q: Any, is_conv: bool):
+        """Prepara vth_q escalar ou vetor por canal para broadcasting em Int32."""
+        if isinstance(vth_q, (int, float, np.integer)):
+            return int(vth_q)
+        t = torch.as_tensor(vth_q, dtype=torch.int32)
+        if t.ndim == 0:
+            return int(t.item())
+        if is_conv and t.ndim == 1:
+            return t.view(1, -1, 1, 1)
+        if is_conv and t.ndim == 3:
+            return t.unsqueeze(0)
+        if not is_conv and t.ndim == 1:
+            return t.view(1, -1)
+        return t
+
     def __init__(self, quant_params: Dict[str, Dict[str, Any]], num_steps: int = 8):
         self.p1 = quant_params["layer1"]
         self.p2 = quant_params["layer2"]
@@ -142,19 +187,19 @@ class BitAccurateInt8CSNN:
         # Tensores para convolução acelerada via PyTorch com aritmética exata inteira
         self.w1_t = self.p1["w_q"].float()
         self.b1_t = self.p1["b_q"].float()
-        self.vth1 = self.p1["vth_q"]
+        self.vth1 = self._prepare_vth(self.p1["vth_q"], is_conv=True)
 
         self.w2_t = self.p2["w_q"].float()
         self.b2_t = self.p2["b_q"].float()
-        self.vth2 = self.p2["vth_q"]
+        self.vth2 = self._prepare_vth(self.p2["vth_q"], is_conv=True)
 
         self.w3_t = self.p3["w_q"].float()
         self.b3_t = self.p3["b_q"].float()
-        self.vth3 = self.p3["vth_q"]
+        self.vth3 = self._prepare_vth(self.p3["vth_q"], is_conv=True)
 
         self.w4_t = self.p4["w_q"].float()
         self.b4_t = self.p4["b_q"].float()
-        self.vth4 = self.p4["vth_q"]
+        self.vth4 = self._prepare_vth(self.p4["vth_q"], is_conv=False)
 
     def forward_batch(
         self, imgs: torch.Tensor
@@ -455,9 +500,37 @@ def export_weights_h(
             lines[-1] = lines[-1].rstrip(",")
         return "\n".join(lines)
 
+    per_channel = bool(p1.get("per_channel", False))
     total_weight_bytes = w1.nbytes + w2.nbytes + w3.nbytes + w4.nbytes
     total_bias_bytes = b1.nbytes + b2.nbytes + b3.nbytes + b4.nbytes
     total_bytes = total_weight_bytes + total_bias_bytes
+
+    if per_channel:
+        vth1_arr = np.asarray(p1["vth_q"], dtype=np.int32)
+        vth2_arr = np.asarray(p2["vth_q"], dtype=np.int32)
+        vth3_arr = np.asarray(p3["vth_q"], dtype=np.int32)
+        vth4_arr = np.asarray(p4["vth_q"], dtype=np.int32)
+        vth_block = f"""/* Fatores de Escala da Entrada e Limiares de Disparo (V_th) Per-Channel em Int32 */
+#define SPIKEVISION_INPUT_SCALE        127
+#define SPIKEVISION_PER_CHANNEL_QUANT  1
+
+SPIKEVISION_ALIGN16 static const int32_t VTH_L1_CH[16] = {{
+{format_array_int32(vth1_arr)}
+}};
+
+SPIKEVISION_ALIGN16 static const int32_t VTH_L2_CH[32] = {{
+{format_array_int32(vth2_arr)}
+}};
+
+SPIKEVISION_ALIGN16 static const int32_t VTH_L3_CH[32] = {{
+{format_array_int32(vth3_arr)}
+}};
+
+SPIKEVISION_ALIGN16 static const int32_t VTH_FC_CH[{num_classes}] = {{
+{format_array_int32(vth4_arr)}
+}};"""
+    else:
+        vth_block = f"""{vth_block}"""
 
     content = f"""/**
  * SpikeVision-S3: Pesos Quantizados Int8 e Constantes da CSNN para ESP32-S3.
@@ -508,12 +581,7 @@ extern "C" {{
 #define SPIKEVISION_BETA_NUM           {BETA_NUM}
 #define SPIKEVISION_BETA_SHIFT         {BETA_SHIFT}
 
-/* Fatores de Escala da Entrada e Limiares de Disparo (V_th) em Int32 */
-#define SPIKEVISION_INPUT_SCALE        127
-#define SPIKEVISION_L1_VTH             {p1['vth_q']}
-#define SPIKEVISION_L2_VTH             {p2['vth_q']}
-#define SPIKEVISION_L3_VTH             {p3['vth_q']}
-#define SPIKEVISION_L4_VTH             {p4['vth_q']}
+{vth_block}
 
 /* Dimensões das Camadas */
 #define CONV1_IN_CHANNELS              3
@@ -870,6 +938,13 @@ def main():
         help="Permite checkpoints legados sem o campo 'encoding' (assume 'direct' sem aviso)",
     )
     parser.add_argument(
+        "--quant-mode",
+        type=str,
+        default="per-channel",
+        choices=["per-channel", "per-tensor"],
+        help="Modo de quantização simétrica Int8 ('per-channel' axis=0 padrão ou 'per-tensor')",
+    )
+    parser.add_argument(
         "--force-encoding-mismatch",
         action="store_true",
         help="Força exportação mesmo se o checkpoint não tiver sido treinado com encoding='direct'",
@@ -931,11 +1006,14 @@ def main():
     b4_f = torch.zeros(model.num_classes, device=device)
 
     # 4. Quantização Int8 e Cálculo de Escalas
-    logger.info("Calculando escalas simétricas e quantizando pesos em Int8 / biases em Int32...")
-    q1 = quantize_layer(w1_f.cpu(), b1_f.cpu(), s_in=127.0, v_th=1.0)
-    q2 = quantize_layer(w2_f.cpu(), b2_f.cpu(), s_in=1.0, v_th=1.0)
-    q3 = quantize_layer(w3_f.cpu(), b3_f.cpu(), s_in=1.0, v_th=1.0)
-    q4 = quantize_layer(w4_f.cpu(), b4_f.cpu(), s_in=1.0, v_th=1.0)
+    per_channel = args.quant_mode == "per-channel"
+    logger.info(
+        f"Calculando escalas simétricas ({args.quant_mode}) e quantizando pesos em Int8 / biases em Int32..."
+    )
+    q1 = quantize_layer(w1_f.cpu(), b1_f.cpu(), s_in=127.0, v_th=1.0, per_channel=per_channel)
+    q2 = quantize_layer(w2_f.cpu(), b2_f.cpu(), s_in=1.0, v_th=1.0, per_channel=per_channel)
+    q3 = quantize_layer(w3_f.cpu(), b3_f.cpu(), s_in=1.0, v_th=1.0, per_channel=per_channel)
+    q4 = quantize_layer(w4_f.cpu(), b4_f.cpu(), s_in=1.0, v_th=1.0, per_channel=per_channel)
 
     quant_params = {
         "layer1": q1,
@@ -944,14 +1022,25 @@ def main():
         "layer4": q4,
     }
 
-    print("\n📊 Parâmetros de Quantização por Camada:")
+    print(f"\n📊 Parâmetros de Quantização por Camada ({args.quant_mode}):")
     for name, q in quant_params.items():
         print(f"  [{name.upper()}]:")
-        print(f"    - W_max:     {q['w_max']:.6f}")
-        print(f"    - S_w:       {q['s_w']:.4f}")
-        print(f"    - S_in:      {q['s_in']:.1f}")
-        print(f"    - S_total:   {q['s_total']:.4f}")
-        print(f"    - V_th Int:  {q['vth_q']} (Float: {q['vth_float']:.1f})")
+        if q.get("per_channel", False):
+            w_max_t = q["w_max"]
+            s_w_t = q["s_w"]
+            s_tot_t = q["s_total"]
+            vth_t = q["vth_q"]
+            print(f"    - W_max:     [{w_max_t.min().item():.6f}, {w_max_t.max().item():.6f}]")
+            print(f"    - S_w:       [{s_w_t.min().item():.4f}, {s_w_t.max().item():.4f}]")
+            print(f"    - S_in:      {q['s_in']:.1f}")
+            print(f"    - S_total:   [{s_tot_t.min().item():.4f}, {s_tot_t.max().item():.4f}]")
+            print(f"    - V_th Int:  [{vth_t.min().item()}, {vth_t.max().item()}] (Float: {q['vth_float']:.1f})")
+        else:
+            print(f"    - W_max:     {q['w_max']:.6f}")
+            print(f"    - S_w:       {q['s_w']:.4f}")
+            print(f"    - S_in:      {q['s_in']:.1f}")
+            print(f"    - S_total:   {q['s_total']:.4f}")
+            print(f"    - V_th Int:  {q['vth_q']} (Float: {q['vth_float']:.1f})")
         print(f"    - W_q shape: {list(q['w_q'].shape)} ({q['w_q'].numel()} bytes)")
         print(f"    - B_q shape: {list(q['b_q'].shape)} ({q['b_q'].numel() * 4} bytes)")
 
@@ -1031,7 +1120,8 @@ def main():
         "epoch": epoch,
         "config": config,
         "quantization_format": {
-            "weights": "int8_t (symmetric per-layer)",
+            "quant_mode": args.quant_mode,
+            "weights": f"int8_t (symmetric {args.quant_mode})",
             "biases": "int32_t (scaled by s_total)",
             "thresholds": "int32_t (scaled by s_total)",
             "input_scale": 127,
@@ -1043,11 +1133,12 @@ def main():
         },
         "layers": {
             k: {
-                "w_max": q["w_max"],
-                "scale_weight": q["s_w"],
+                "per_channel": bool(q.get("per_channel", False)),
+                "w_max": q["w_max"].tolist() if isinstance(q["w_max"], torch.Tensor) else q["w_max"],
+                "scale_weight": q["s_w"].tolist() if isinstance(q["s_w"], torch.Tensor) else q["s_w"],
                 "scale_input": q["s_in"],
-                "scale_total": q["s_total"],
-                "vth_quantized": q["vth_q"],
+                "scale_total": q["s_total"].tolist() if isinstance(q["s_total"], torch.Tensor) else q["s_total"],
+                "vth_quantized": q["vth_q"].tolist() if isinstance(q["vth_q"], torch.Tensor) else q["vth_q"],
                 "weight_shape": list(q["w_q"].shape),
                 "bias_shape": list(q["b_q"].shape),
             }
