@@ -1,55 +1,115 @@
 #!/usr/bin/env python3
 """
 ================================================================================
-SpikeVision-S3: Treinamento CSNN no Google Colab (Script 100% Autocontido)
+SpikeVision-S3: Treinamento CSNN no Google Colab
 ================================================================================
 Instruções de Uso no Google Colab:
 1. Abra um novo notebook no Google Colab (https://colab.research.google.com).
 2. Vá no menu: 'Ambiente de execução' > 'Alterar tipo de ambiente de execução'
    e selecione 'T4 GPU' (Hardware accelerator: GPU).
-3. Copie todo o conteúdo deste arquivo e cole em uma única célula de código.
-4. Execute a célula (Shift + Enter).
-5. O script irá:
-   - Verificar e instalar automaticamente a biblioteca `snntorch`;
-   - Baixar e balancear o CIFAR-10 (Gato vs Não-Gato, 10.000 treino, 2.000 teste);
-   - Treinar a CSNN (SpikeVisionCSNN) com 15.400 parâmetros (~15.4 KB Int8);
-   - Monitorar Acurácia, F1-Score da classe Gato, Firing Rate e Esparsidade;
-   - Salvar o melhor checkpoint 'best_spikevision_csnn.pth';
-   - Acionar o download automático do modelo treinado para o seu computador!
+3. Clone o repositório e execute este script:
+   !git clone https://github.com/johnknevescarrijo/SpikeVision-S3.git
+   %cd SpikeVision-S3
+   !python3 training/colab_train.py
+4. O script irá:
+   - Verificar e instalar automaticamente `snntorch` caso ausente;
+   - Reutilizar os módulos canônicos em `training/` (sem código duplicado);
+   - Treinar a CSNN (`SpikeVisionCSNN`) no CIFAR-10 (10 classes ou binário);
+   - Salvar o melhor checkpoint 'best_spikevision_csnn.pth' e o histórico JSON;
+   - Acionar o download automático do modelo no Google Colab!
 ================================================================================
 """
 
-import sys
-import subprocess
+from __future__ import annotations
 
-# 1. Instalação automática de dependências caso ausentes no ambiente Colab
+import json
+import os
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+
+def _ensure_repo_root_in_path() -> Path:
+    """Garante que o diretório raiz do repositório esteja no sys.path."""
+    candidates = []
+    if "__file__" in globals():
+        candidates.append(Path(__file__).resolve().parent.parent)
+    cwd = Path.cwd().resolve()
+    candidates.extend([cwd, cwd / "SpikeVision-S3"])
+
+    for candidate in candidates:
+        if (candidate / "training" / "models" / "csnn.py").is_file():
+            candidate_str = str(candidate)
+            if candidate_str not in sys.path:
+                sys.path.insert(0, candidate_str)
+            return candidate
+    return cwd
+
+
+REPO_ROOT = _ensure_repo_root_in_path()
+
+# Instalação automática de dependências caso ausentes no ambiente Colab
 try:
-    import snntorch
+    import snntorch  # noqa: F401
 except ImportError:
     print("⚡ Instalando snnTorch para o ambiente Colab...")
     subprocess.check_call([sys.executable, "-m", "pip", "install", "-q", "snntorch"])
-    import snntorch
+    import snntorch  # noqa: F401
 
-import os
-import time
-import json
-import random
-from typing import Tuple, Optional, Callable, Dict, Any, Union
-
-import numpy as np
 import torch
-import torch.nn as nn
-import torch.nn.functional as F
 import torch.optim as optim
-from torch.utils.data import Dataset, DataLoader
-import torchvision
-import torchvision.transforms as transforms
 
-import snntorch as snn
-from snntorch import surrogate
-import snntorch.spikegen as spikegen
-import snntorch.functional as SF
-from tqdm import tqdm
+from training.datasets.cifar10_cat import (  # noqa: E402
+    CIFAR10_CAT_LABEL,
+    CIFAR10_CLASS_NAMES,
+    BinaryCatCIFAR10,
+    encode_spikes,
+    get_cifar10_multiclass_dataloaders,
+    get_dataloaders as get_binary_dataloaders,
+)
+from training.models.csnn import SpikeVisionCSNN, count_parameters, print_model_summary  # noqa: E402
+from training.models.qat import QATConv2d, QATLinear, fake_quantize_int8_ste  # noqa: E402
+from training.quantize_export import (  # noqa: E402
+    BitAccurateInt8CSNN,
+    export_weights_h,
+    fuse_conv_bn,
+)
+from training.train import (  # noqa: E402
+    build_loss_fn,
+    compute_multiclass_metrics,
+    compute_temporal_loss,
+    evaluate,
+    set_seed,
+    train_one_epoch,
+)
+
+__all__ = [
+    "CONFIG",
+    "REPO_ROOT",
+    "CIFAR10_CAT_LABEL",
+    "CIFAR10_CLASS_NAMES",
+    "BinaryCatCIFAR10",
+    "encode_spikes",
+    "get_cifar10_multiclass_dataloaders",
+    "get_binary_dataloaders",
+    "SpikeVisionCSNN",
+    "count_parameters",
+    "print_model_summary",
+    "QATConv2d",
+    "QATLinear",
+    "fake_quantize_int8_ste",
+    "BitAccurateInt8CSNN",
+    "export_weights_h",
+    "fuse_conv_bn",
+    "build_loss_fn",
+    "compute_multiclass_metrics",
+    "compute_temporal_loss",
+    "evaluate",
+    "set_seed",
+    "train_one_epoch",
+    "main",
+]
 
 
 # ==============================================================================
@@ -73,7 +133,7 @@ CONFIG = {
     "qat": False,            # Quantization-Aware Training (STE Int8)
     "qat_per_channel": True, # True = per-channel (axis=0), False = per-tensor
     "in_channels": 3,        # 3 para RGB (ou 1 para escala de cinza)
-    "num_classes": 10,       # 10 classes completas do CIFAR-10
+    "num_classes": 10,       # 10 classes completas do CIFAR-10 (ou 2 para Gato vs Não-Gato)
 
     # Sistema e Reprodutibilidade
     "seed": 42,
@@ -84,703 +144,12 @@ CONFIG = {
 }
 
 
-# ==============================================================================
-# REPRODUTIBILIDADE
-# ==============================================================================
-def set_seed(seed: int = 42):
-    """Garante reprodutibilidade em todas as bibliotecas e inicializações."""
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(seed)
-        torch.backends.cudnn.deterministic = True
-        torch.backends.cudnn.benchmark = False
-
-
-# ==============================================================================
-# DATASET: CIFAR-10 COMPLETO (10 CLASSES)
-# ==============================================================================
-CIFAR10_CAT_LABEL = 3
-
-CIFAR10_CLASS_NAMES = [
-    "airplane",
-    "automobile",
-    "bird",
-    "cat",
-    "deer",
-    "dog",
-    "frog",
-    "horse",
-    "ship",
-    "truck",
-]
-
-
-class BinaryCatCIFAR10(Dataset):
-    """
-    Dataset balanceado 'Gato' (1) vs 'Não-Gato' (0) baseado no CIFAR-10.
-    - Treino: 5.000 gatos + 5.000 não-gatos (total: 10.000 amostras balanceadas).
-    - Teste: 1.000 gatos + 1.000 não-gatos (total: 2.000 amostras balanceadas).
-    - As amostras não-gato são amostradas de maneira uniforme das outras 9 classes.
-    """
-
-    def __init__(
-        self,
-        root: str = "./data",
-        train: bool = True,
-        transform: Optional[Callable] = None,
-        in_channels: int = 3,
-        download: bool = True,
-        seed: int = 42,
-    ):
-        super().__init__()
-        self.root = root
-        self.train = train
-        self.in_channels = in_channels
-        self.seed = seed
-
-        if transform is not None:
-            self.transform = transform
-        else:
-            transform_list = []
-            if train:
-                transform_list.extend([
-                    transforms.RandomCrop(32, padding=4),
-                    transforms.RandomHorizontalFlip(),
-                ])
-            if in_channels == 1:
-                transform_list.append(transforms.Grayscale(num_output_channels=1))
-            transform_list.append(transforms.ToTensor())  # Escala para [0.0, 1.0]
-            self.transform = transforms.Compose(transform_list)
-
-        try:
-            self.cifar10 = torchvision.datasets.CIFAR10(
-                root=self.root,
-                train=self.train,
-                download=download,
-                transform=None,
-            )
-            self.is_synthetic = False
-            self.indices, self.binary_targets = self._balance_dataset()
-        except Exception as e:
-            print(f"⚠️ Não foi possível baixar CIFAR-10 ({e}). Gerando dados sintéticos para fallback.")
-            self.is_synthetic = True
-            self._create_synthetic_data()
-
-    def _create_synthetic_data(self):
-        """Cria dados sintéticos balanceados caso o download do CIFAR-10 falhe."""
-        n_samples = 200 if not self.train else 400
-        rng = np.random.RandomState(self.seed)
-        self.synthetic_images = rng.randint(0, 256, size=(n_samples, 32, 32, 3), dtype=np.uint8)
-        self.binary_targets = np.array([1 if i % 2 == 0 else 0 for i in range(n_samples)], dtype=np.int64)
-        self.indices = list(range(n_samples))
-
-    def _balance_dataset(self) -> Tuple[np.ndarray, np.ndarray]:
-        """Filtra gatos (label 3 -> 1) e amostra igualmente das outras 9 classes (label 0)."""
-        targets = np.array(self.cifar10.targets)
-        cat_indices = np.where(targets == CIFAR10_CAT_LABEL)[0]
-        num_cats = len(cat_indices)
-
-        rng = np.random.RandomState(self.seed)
-
-        other_classes = [c for c in range(10) if c != CIFAR10_CAT_LABEL]
-        samples_per_class = num_cats // len(other_classes)
-        remainder = num_cats % len(other_classes)
-
-        non_cat_indices = []
-        for i, c in enumerate(other_classes):
-            c_indices = np.where(targets == c)[0]
-            take_count = samples_per_class + (1 if i < remainder else 0)
-            chosen = rng.choice(c_indices, size=take_count, replace=False)
-            non_cat_indices.extend(chosen)
-
-        non_cat_indices = np.array(non_cat_indices)
-
-        all_indices = np.concatenate([cat_indices, non_cat_indices])
-        all_targets = np.concatenate([
-            np.ones(len(cat_indices), dtype=np.int64),
-            np.zeros(len(non_cat_indices), dtype=np.int64),
-        ])
-
-        shuffle_perm = rng.permutation(len(all_indices))
-        return all_indices[shuffle_perm], all_targets[shuffle_perm]
-
-    def __len__(self) -> int:
-        return len(self.binary_targets)
-
-    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, int]:
-        if getattr(self, "is_synthetic", False):
-            img_arr = self.synthetic_images[idx]
-            from PIL import Image
-            img = Image.fromarray(img_arr)
-            target = int(self.binary_targets[idx])
-        else:
-            orig_idx = self.indices[idx]
-            img, _ = self.cifar10[orig_idx]
-            target = int(self.binary_targets[idx])
-
-        if self.transform is not None:
-            img = self.transform(img)
-
-        return img, target
-
-
-def encode_spikes(
-    images: torch.Tensor,
-    num_steps: int = 8,
-    method: str = "direct",
-) -> torch.Tensor:
-    """
-    Converte um tensor de imagens [B, C, H, W] em trens de spikes ao longo do tempo [T, B, C, H, W].
-    """
-    if method == "rate":
-        return spikegen.rate(images, num_steps=num_steps)
-    elif method == "direct":
-        return images.unsqueeze(0).repeat(num_steps, 1, 1, 1, 1)
-    else:
-        raise ValueError(f"Método '{method}' não suportado. Escolha 'rate' ou 'direct'.")
-
-
-def get_dataloaders(
-    data_dir: str = "./data",
-    batch_size: int = 128,
-    num_workers: int = 2,
-    in_channels: int = 3,
-    seed: int = 42,
-    augment: bool = True,
-) -> Tuple[DataLoader, DataLoader]:
-    """Cria os DataLoaders para treino e teste do CIFAR-10 completo (10 classes)."""
-    os.makedirs(data_dir, exist_ok=True)
-
-    train_transforms_list = []
-    if augment:
-        train_transforms_list.extend([
-            transforms.RandomCrop(32, padding=4, padding_mode="reflect"),
-            transforms.RandomHorizontalFlip(),
-        ])
-    if in_channels == 1:
-        train_transforms_list.append(transforms.Grayscale(num_output_channels=1))
-    train_transforms_list.append(transforms.ToTensor())
-    train_transform = transforms.Compose(train_transforms_list)
-
-    test_transforms_list = []
-    if in_channels == 1:
-        test_transforms_list.append(transforms.Grayscale(num_output_channels=1))
-    test_transforms_list.append(transforms.ToTensor())
-    test_transform = transforms.Compose(test_transforms_list)
-
-    train_dataset = torchvision.datasets.CIFAR10(
-        root=data_dir,
-        train=True,
-        download=True,
-        transform=train_transform,
-    )
-
-    test_dataset = torchvision.datasets.CIFAR10(
-        root=data_dir,
-        train=False,
-        download=True,
-        transform=test_transform,
-    )
-
-    train_loader = DataLoader(
-        train_dataset,
-        batch_size=batch_size,
-        shuffle=True,
-        num_workers=num_workers,
-        pin_memory=torch.cuda.is_available(),
-        drop_last=False,
-    )
-
-    test_loader = DataLoader(
-        test_dataset,
-        batch_size=batch_size,
-        shuffle=False,
-        num_workers=num_workers,
-        pin_memory=torch.cuda.is_available(),
-        drop_last=False,
-    )
-
-    return train_loader, test_loader
-
-
-# ==============================================================================
-# QAT (QUANTIZATION-AWARE TRAINING) COM STE INT8
-# ==============================================================================
-def fake_quantize_int8_ste(weight: torch.Tensor, per_channel: bool = True) -> torch.Tensor:
-    """Fake quantization simétrica Int8 [-127, 127] com STE no backward."""
-    if per_channel:
-        w_flat = weight.detach().reshape(weight.shape[0], -1)
-        w_max = w_flat.abs().max(dim=1).values
-        s_w = torch.where(w_max < 1e-8, torch.ones_like(w_max), 127.0 / w_max)
-        s_w = s_w.view(-1, *([1] * (weight.dim() - 1)))
-    else:
-        w_max = weight.detach().abs().max()
-        s_w = torch.where(w_max < 1e-8, torch.ones_like(w_max), 127.0 / w_max)
-    w_q = torch.clamp(torch.round(weight * s_w), -127.0, 127.0) / s_w
-    return weight + (w_q - weight).detach()
-
-
-class QATConv2d(nn.Conv2d):
-    def __init__(self, *args, per_channel: bool = True, qat_enabled: bool = True, **kwargs):
-        super().__init__(*args, **kwargs)
-        self.per_channel = per_channel
-        self.qat_enabled = qat_enabled
-
-    def forward(self, input: torch.Tensor) -> torch.Tensor:
-        w = fake_quantize_int8_ste(self.weight, per_channel=self.per_channel) if self.qat_enabled else self.weight
-        return self._conv_forward(input, w, self.bias)
-
-
-class QATLinear(nn.Linear):
-    def __init__(self, *args, per_channel: bool = True, qat_enabled: bool = True, **kwargs):
-        super().__init__(*args, **kwargs)
-        self.per_channel = per_channel
-        self.qat_enabled = qat_enabled
-
-    def forward(self, input: torch.Tensor) -> torch.Tensor:
-        w = fake_quantize_int8_ste(self.weight, per_channel=self.per_channel) if self.qat_enabled else self.weight
-        return F.linear(input, w, self.bias)
-
-
-# ==============================================================================
-# MODELO: SPIKEVISION CONVOLUTIONAL SNN (CSNN) PARA ESP32-S3
-# ==============================================================================
-class SpikeVisionCSNN(nn.Module):
-    """
-    Convolutional Spiking Neural Network (CSNN) para classificação CIFAR-10 (10 classes).
-    Arquitetura ultra-compacta (~19.5 KB Int8) ideal para o ESP32-S3.
-    """
-
-    def __init__(
-        self,
-        in_channels: int = 3,
-        num_classes: int = 10,
-        beta: float = 0.9,
-        slope: float = 25.0,
-        qat: bool = False,
-        qat_per_channel: bool = True,
-    ):
-        super().__init__()
-        self.in_channels = in_channels
-        self.num_classes = num_classes
-        self.beta = beta
-        self.qat = qat
-        self.qat_per_channel = qat_per_channel
-
-        spike_grad = surrogate.fast_sigmoid(slope=slope)
-
-        def make_conv(in_c: int, out_c: int) -> nn.Conv2d:
-            if qat:
-                return QATConv2d(in_c, out_c, kernel_size=3, padding=1, bias=False, per_channel=qat_per_channel)
-            return nn.Conv2d(in_c, out_c, kernel_size=3, padding=1, bias=False)
-
-        # Camada 1: 32x32 -> MaxPool -> 16x16
-        self.conv1 = make_conv(in_channels, 16)
-        self.bn1 = nn.BatchNorm2d(16)
-        self.pool1 = nn.MaxPool2d(2)
-        self.lif1 = snn.Leaky(beta=beta, spike_grad=spike_grad, init_hidden=False)
-
-        # Camada 2: 16x16 -> MaxPool -> 8x8
-        self.conv2 = make_conv(16, 32)
-        self.bn2 = nn.BatchNorm2d(32)
-        self.pool2 = nn.MaxPool2d(2)
-        self.lif2 = snn.Leaky(beta=beta, spike_grad=spike_grad, init_hidden=False)
-
-        # Camada 3: 8x8 -> MaxPool -> 4x4
-        self.conv3 = make_conv(32, 32)
-        self.bn3 = nn.BatchNorm2d(32)
-        self.pool3 = nn.MaxPool2d(2)
-        self.lif3 = snn.Leaky(beta=beta, spike_grad=spike_grad, init_hidden=False)
-
-        # Classificador (Head): 32 * 4 * 4 = 512 neurônios -> num_classes
-        self.flatten = nn.Flatten()
-        if qat:
-            self.fc = QATLinear(32 * 4 * 4, num_classes, bias=False, per_channel=qat_per_channel)
-        else:
-            self.fc = nn.Linear(32 * 4 * 4, num_classes, bias=False)
-        self.lif4 = snn.Leaky(beta=beta, spike_grad=spike_grad, init_hidden=False)
-        self.last_hidden_spikes: Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = None
-
-    def init_membrane_potentials(
-        self, batch_size: int, device: torch.device
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Inicializa potenciais de membrana U das 4 camadas com zeros."""
-        mem1 = torch.zeros((batch_size, 16, 16, 16), device=device)
-        mem2 = torch.zeros((batch_size, 32, 8, 8), device=device)
-        mem3 = torch.zeros((batch_size, 32, 4, 4), device=device)
-        mem4 = torch.zeros((batch_size, self.num_classes), device=device)
-        return mem1, mem2, mem3, mem4
-
-    def forward(
-        self,
-        x: torch.Tensor,
-        num_steps: int = 8,
-        encoding: str = "direct",
-        return_sparsity: bool = True,
-    ) -> Union[Tuple[torch.Tensor, torch.Tensor], Tuple[torch.Tensor, torch.Tensor, Dict[str, float]]]:
-        """Propagação direta temporal na SpikeVisionCSNN."""
-        if x.dim() == 4:
-            spk_in = encode_spikes(x, num_steps=num_steps, method=encoding)
-            t_steps = num_steps
-            batch_size = x.size(0)
-        elif x.dim() == 5:
-            spk_in = x
-            t_steps = x.size(0)
-            batch_size = x.size(1)
-        else:
-            raise ValueError(f"Shape de entrada inválido: {x.shape}")
-
-        device = x.device
-        mem1, mem2, mem3, mem4 = self.init_membrane_potentials(batch_size, device)
-
-        spk_out_rec = []
-        mem_out_rec = []
-        spk1_rec = []
-        spk2_rec = []
-        spk3_rec = []
-
-        spk_count_l1 = 0
-        spk_count_l2 = 0
-        spk_count_l3 = 0
-        spk_count_l4 = 0
-
-        for t in range(t_steps):
-            inp_t = spk_in[t]
-
-            # Layer 1
-            cur1 = self.pool1(self.bn1(self.conv1(inp_t)))
-            spk1, mem1 = self.lif1(cur1, mem1)
-
-            # Layer 2
-            cur2 = self.pool2(self.bn2(self.conv2(spk1)))
-            spk2, mem2 = self.lif2(cur2, mem2)
-
-            # Layer 3
-            cur3 = self.pool3(self.bn3(self.conv3(spk2)))
-            spk3, mem3 = self.lif3(cur3, mem3)
-
-            # Head (Linear)
-            flat = self.flatten(spk3)
-            cur4 = self.fc(flat)
-            spk4, mem4 = self.lif4(cur4, mem4)
-
-            spk1_rec.append(spk1)
-            spk2_rec.append(spk2)
-            spk3_rec.append(spk3)
-            spk_out_rec.append(spk4)
-            mem_out_rec.append(mem4)
-
-            if return_sparsity:
-                spk_count_l1 += spk1.detach().sum().item()
-                spk_count_l2 += spk2.detach().sum().item()
-                spk_count_l3 += spk3.detach().sum().item()
-                spk_count_l4 += spk4.detach().sum().item()
-
-        self.last_hidden_spikes = (
-            torch.stack(spk1_rec, dim=0),
-            torch.stack(spk2_rec, dim=0),
-            torch.stack(spk3_rec, dim=0),
-        )
-        spk_out = torch.stack(spk_out_rec, dim=0)
-        mem_out = torch.stack(mem_out_rec, dim=0)
-
-        if not return_sparsity:
-            return spk_out, mem_out
-
-        total_neurons_l1 = t_steps * batch_size * (16 * 16 * 16)
-        total_neurons_l2 = t_steps * batch_size * (32 * 8 * 8)
-        total_neurons_l3 = t_steps * batch_size * (32 * 4 * 4)
-        total_neurons_l4 = t_steps * batch_size * self.num_classes
-        total_neurons_all = total_neurons_l1 + total_neurons_l2 + total_neurons_l3 + total_neurons_l4
-        total_spikes_all = spk_count_l1 + spk_count_l2 + spk_count_l3 + spk_count_l4
-
-        overall_firing_rate = total_spikes_all / max(total_neurons_all, 1)
-
-        sparsity_dict = {
-            "firing_rate_layer1": spk_count_l1 / max(total_neurons_l1, 1),
-            "firing_rate_layer2": spk_count_l2 / max(total_neurons_l2, 1),
-            "firing_rate_layer3": spk_count_l3 / max(total_neurons_l3, 1),
-            "firing_rate_layer4": spk_count_l4 / max(total_neurons_l4, 1),
-            "overall_firing_rate": overall_firing_rate,
-            "overall_sparsity": 1.0 - overall_firing_rate,
-        }
-
-        return spk_out, mem_out, sparsity_dict
-
-    def compute_firing_rate_loss(self, target_rate: Optional[float] = None) -> torch.Tensor:
-        """Calcula a regularização de esparsidade sobre os spikes das camadas ocultas."""
-        device = next(self.parameters()).device
-        if self.last_hidden_spikes is None:
-            return torch.tensor(0.0, device=device)
-        mean_rate = torch.stack([s.mean() for s in self.last_hidden_spikes]).mean()
-        if target_rate is None:
-            return mean_rate
-        return torch.abs(mean_rate - target_rate)
-
-
-def print_model_summary(model: nn.Module):
-    """Exibe um sumário legível da arquitetura e ocupação estimada na SRAM."""
-    total_params = 0
-    print("=" * 72)
-    print("                 SpikeVision-S3 CSNN Model Summary")
-    print("=" * 72)
-    print(f"{'Layer / Parameter':<35} {'Shape':<20} {'Params':<10} {'Int8 (B)':<8}")
-    print("-" * 72)
-    for name, param in model.named_parameters():
-        count = param.numel()
-        total_params += count
-        shape_str = str(list(param.shape))
-        print(f"{name:<35} {shape_str:<20} {count:<10} {count * 1:<8}")
-    print("=" * 72)
-    print(f"Total de Parâmetros:      {total_params:,}")
-    print(f"Tamanho em Float32:       {(total_params * 4) / 1024.0:.2f} KB")
-    print(f"Tamanho estimado em Int8: {(total_params * 1) / 1024.0:.2f} KB  <-- [Compatível c/ SRAM 512KB ESP32-S3]")
-    print("=" * 72)
-
-
-# ==============================================================================
-# LOOP DE TREINO E AVALIAÇÃO
-# ==============================================================================
-def build_loss_fn(loss_type: str) -> nn.Module:
-    """Constrói a função de perda temporal SNN a partir do identificador."""
-    if loss_type == "ce_rate":
-        return SF.ce_rate_loss()
-    if loss_type == "ce_mem":
-        mem_loss_cls = getattr(SF, "ce_mem_loss", SF.ce_max_membrane_loss)
-        return mem_loss_cls()
-    if loss_type == "mse_count":
-        return SF.mse_count_loss(correct_rate=0.8, incorrect_rate=0.2)
-    raise ValueError(f"Função de perda desconhecida: {loss_type}")
-
-
-def compute_temporal_loss(
-    criterion: nn.Module,
-    loss_type: str,
-    spk_out: torch.Tensor,
-    mem_out: torch.Tensor,
-    targets: torch.Tensor,
-) -> torch.Tensor:
-    """Aplica a loss temporal selecionada sobre spikes ou potenciais de membrana."""
-    if loss_type == "ce_mem":
-        return criterion(mem_out, targets)
-    return criterion(spk_out, targets)
-
-
-def train_one_epoch(
-    model: nn.Module,
-    train_loader: DataLoader,
-    criterion: nn.Module,
-    optimizer: optim.Optimizer,
-    device: torch.device,
-    num_steps: int,
-    encoding: str,
-    loss_type: str = "ce_rate",
-    sparsity_weight: float = 0.0,
-    target_rate: Optional[float] = None,
-) -> Tuple[float, float, float]:
-    """Treina uma época do modelo."""
-    model.train()
-    total_loss = 0.0
-    correct = 0
-    total_samples = 0
-    firing_rates = []
-
-    for images, targets in tqdm(train_loader, desc="Treino", leave=False):
-        images = images.to(device)
-        targets = targets.to(device)
-
-        optimizer.zero_grad()
-
-        spk_out, mem_out, sparsity_dict = model(
-            images, num_steps=num_steps, encoding=encoding, return_sparsity=True
-        )
-
-        loss = compute_temporal_loss(criterion, loss_type, spk_out, mem_out, targets)
-        if sparsity_weight > 0.0:
-            loss = loss + sparsity_weight * model.compute_firing_rate_loss(target_rate=target_rate)
-        loss.backward()
-        optimizer.step()
-
-        total_loss += loss.item() * targets.size(0)
-
-        spike_counts = spk_out.sum(dim=0)
-        preds = spike_counts.argmax(dim=1)
-
-        no_spike_mask = (spike_counts.sum(dim=1) == 0)
-        if no_spike_mask.any():
-            preds[no_spike_mask] = mem_out[-1, no_spike_mask].argmax(dim=1)
-
-        correct += (preds == targets).sum().item()
-        total_samples += targets.size(0)
-        firing_rates.append(sparsity_dict["overall_firing_rate"])
-
-    avg_loss = total_loss / max(total_samples, 1)
-    acc = correct / max(total_samples, 1)
-    avg_fr = float(np.mean(firing_rates)) if firing_rates else 0.0
-    return avg_loss, acc, avg_fr
-
-
-def compute_multiclass_metrics(
-    preds: torch.Tensor,
-    targets: torch.Tensor,
-    num_classes: int = 10,
-    class_names: Any = None,
-) -> Dict[str, Any]:
-    """
-    Calcula acurácia top-1, métricas macro (precisão, recall, f1)
-    e métricas por classe para classificação multi-classe.
-    """
-    if class_names is None:
-        if num_classes == 10:
-            class_names = CIFAR10_CLASS_NAMES
-        else:
-            class_names = [f"class_{i}" for i in range(num_classes)]
-
-    if isinstance(preds, torch.Tensor):
-        preds_np = preds.detach().cpu().numpy()
-    else:
-        preds_np = np.asarray(preds)
-
-    if isinstance(targets, torch.Tensor):
-        targets_np = targets.detach().cpu().numpy()
-    else:
-        targets_np = np.asarray(targets)
-
-    total_samples = len(targets_np)
-    correct = int((preds_np == targets_np).sum())
-    accuracy = correct / max(total_samples, 1)
-
-    per_class_f1 = {}
-    per_class_accuracy = {}
-    precisions = []
-    recalls = []
-    f1s = []
-
-    for c in range(num_classes):
-        c_name = class_names[c] if c < len(class_names) else f"class_{c}"
-        tp = int(((preds_np == c) & (targets_np == c)).sum())
-        fp = int(((preds_np == c) & (targets_np != c)).sum())
-        fn = int(((preds_np != c) & (targets_np == c)).sum())
-        class_total = int((targets_np == c).sum())
-
-        prec = tp / max(tp + fp, 1e-9) if (tp + fp) > 0 else 0.0
-        rec = tp / max(tp + fn, 1e-9) if (tp + fn) > 0 else 0.0
-        f1 = 2.0 * (prec * rec) / max(prec + rec, 1e-9) if (prec + rec) > 0 else 0.0
-        class_acc = tp / max(class_total, 1) if class_total > 0 else 0.0
-
-        per_class_f1[c_name] = float(f1)
-        per_class_accuracy[c_name] = float(class_acc)
-        precisions.append(prec)
-        recalls.append(rec)
-        f1s.append(f1)
-
-    macro_precision = float(np.mean(precisions)) if precisions else 0.0
-    macro_recall = float(np.mean(recalls)) if recalls else 0.0
-    macro_f1 = float(np.mean(f1s)) if f1s else 0.0
-
-    metrics: Dict[str, Any] = {
-        "accuracy": float(accuracy),
-        "macro_precision": macro_precision,
-        "macro_recall": macro_recall,
-        "macro_f1": macro_f1,
-        "per_class_f1": per_class_f1,
-        "per_class_accuracy": per_class_accuracy,
-    }
-
-    # Compatibilidade retroativa para binário / chave gato
-    cat_idx = 3 if num_classes == 10 else 1
-    if cat_idx < num_classes:
-        metrics["cat_precision"] = float(precisions[cat_idx])
-        metrics["cat_recall"] = float(recalls[cat_idx])
-        metrics["cat_f1"] = float(f1s[cat_idx])
-
-    return metrics
-
-
-def evaluate(
-    model: nn.Module,
-    data_loader: DataLoader,
-    criterion: nn.Module,
-    device: torch.device,
-    num_steps: int,
-    encoding: str,
-    loss_type: str = "ce_rate",
-    num_classes: Optional[int] = None,
-) -> Dict[str, Any]:
-    """Avalia o modelo calculando Acurácia, Macro-F1, Precisão, Recall e Esparsidade."""
-    model.eval()
-    total_loss = 0.0
-    total_samples = 0
-
-    if num_classes is None:
-        num_classes = getattr(model, "num_classes", 10)
-
-    all_preds = []
-    all_targets = []
-    overall_fr_list = []
-    overall_sp_list = []
-
-    with torch.no_grad():
-        for images, targets in data_loader:
-            images = images.to(device)
-            targets = targets.to(device)
-
-            spk_out, mem_out, sparsity_dict = model(
-                images, num_steps=num_steps, encoding=encoding, return_sparsity=True
-            )
-
-            loss = compute_temporal_loss(criterion, loss_type, spk_out, mem_out, targets)
-            total_loss += loss.item() * targets.size(0)
-
-            spike_counts = spk_out.sum(dim=0)
-            preds = spike_counts.argmax(dim=1)
-
-            no_spike_mask = (spike_counts.sum(dim=1) == 0)
-            if no_spike_mask.any():
-                preds[no_spike_mask] = mem_out[-1, no_spike_mask].argmax(dim=1)
-
-            all_preds.append(preds.cpu())
-            all_targets.append(targets.cpu())
-            total_samples += targets.size(0)
-
-            overall_fr_list.append(sparsity_dict["overall_firing_rate"])
-            overall_sp_list.append(sparsity_dict["overall_sparsity"])
-
-    avg_loss = total_loss / max(total_samples, 1)
-
-    if all_preds:
-        cat_preds = torch.cat(all_preds, dim=0)
-        cat_targets = torch.cat(all_targets, dim=0)
-        metrics = compute_multiclass_metrics(cat_preds, cat_targets, num_classes=num_classes)
-    else:
-        metrics = {
-            "accuracy": 0.0,
-            "macro_precision": 0.0,
-            "macro_recall": 0.0,
-            "macro_f1": 0.0,
-            "per_class_f1": {},
-            "per_class_accuracy": {},
-        }
-
-    metrics["loss"] = avg_loss
-    metrics["total_samples"] = total_samples
-    metrics["overall_firing_rate"] = float(np.mean(overall_fr_list)) if overall_fr_list else 0.0
-    metrics["overall_sparsity"] = float(np.mean(overall_sp_list)) if overall_sp_list else 0.0
-    return metrics
-
-
-# ==============================================================================
-# EXECUÇÃO PRINCIPAL
-# ==============================================================================
 def main():
     set_seed(CONFIG["seed"])
 
-    # 1. Detecção do Dispositivo
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print("=" * 72)
-    print("🚀 SpikeVision-S3: Treinamento CSNN no Google Colab (10 Classes CIFAR-10)")
+    print("🚀 SpikeVision-S3: Treinamento CSNN no Google Colab")
     print("=" * 72)
     print(f"Dispositivo de execução: {device}")
     if torch.cuda.is_available():
@@ -792,19 +161,29 @@ def main():
         print("💡 Dica no Colab: 'Ambiente de execução' > 'Alterar tipo' > 'T4 GPU'.")
     print("=" * 72)
 
-    # 2. Carregar Dados
-    print(f"\nCarregando CIFAR-10 completo (10 classes, Batch Size: {CONFIG['batch_size']}, Workers: {CONFIG['num_workers']})...")
-    train_loader, test_loader = get_dataloaders(
-        data_dir=CONFIG["data_dir"],
-        batch_size=CONFIG["batch_size"],
-        num_workers=CONFIG["num_workers"],
-        in_channels=CONFIG["in_channels"],
-        seed=CONFIG["seed"],
-        augment=True,
+    # Carregar Dados usando os loaders canônicos
+    print(
+        f"\nCarregando CIFAR-10 ({CONFIG['num_classes']} classes, "
+        f"Batch Size: {CONFIG['batch_size']}, Workers: {CONFIG['num_workers']})..."
     )
+    if CONFIG["num_classes"] == 10:
+        train_loader, test_loader = get_cifar10_multiclass_dataloaders(
+            data_dir=CONFIG["data_dir"],
+            batch_size=CONFIG["batch_size"],
+            num_workers=CONFIG["num_workers"],
+            augment=True,
+        )
+    else:
+        train_loader, test_loader = get_binary_dataloaders(
+            data_dir=CONFIG["data_dir"],
+            batch_size=CONFIG["batch_size"],
+            num_workers=CONFIG["num_workers"],
+            in_channels=CONFIG["in_channels"],
+            seed=CONFIG["seed"],
+        )
     print(f"✓ Amostras de Treino: {len(train_loader.dataset):,} | Amostras de Teste: {len(test_loader.dataset):,}")
 
-    # 3. Inicializar Modelo SNN
+    # Inicializar Modelo SNN canônico
     model = SpikeVisionCSNN(
         in_channels=CONFIG["in_channels"],
         num_classes=CONFIG["num_classes"],
@@ -816,7 +195,6 @@ def main():
 
     print_model_summary(model)
 
-    # 4. Otimizador, Scheduler e Loss
     optimizer = optim.Adam(model.parameters(), lr=CONFIG["lr"], weight_decay=CONFIG["weight_decay"])
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=CONFIG["epochs"], eta_min=1e-5)
     criterion = build_loss_fn(CONFIG["loss_type"])
@@ -900,7 +278,6 @@ def main():
         }
         history.append(record)
 
-        # Salvar checkpoint se superar a melhor acurácia de teste
         if test_acc >= best_acc:
             best_acc = test_acc
             checkpoint_payload = {
@@ -928,7 +305,6 @@ def main():
 
     total_duration = time.time() - start_total_time
 
-    # Salvar histórico de treinamento
     with open(CONFIG["history_path"], "w") as f:
         json.dump(history, f, indent=2)
 
@@ -940,7 +316,6 @@ def main():
     print(f"Histórico Salvo:         {CONFIG['history_path']}")
     print("=" * 72)
 
-    # 5. Download automático se estiver rodando no Google Colab
     if "google.colab" in sys.modules:
         print("\n📥 Ambiente Google Colab detectado! Iniciando download automático do checkpoint...")
         try:
@@ -954,5 +329,5 @@ def main():
         print(f"\n💡 Dica: Mova o arquivo '{best_checkpoint_path}' para 'training/checkpoints/' para quantização.")
 
 
-if __name__ == "__main__" or "google.colab" in sys.modules:
+if __name__ == "__main__":
     main()
