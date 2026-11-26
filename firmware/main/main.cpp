@@ -13,6 +13,7 @@
 #include "snn_pipeline.h"
 #include "image_preprocess.h"
 #include "camera_capture.h"
+#include "dvs_encoder.h"
 #include "test_samples.h"
 
 #if defined(ESP_PLATFORM)
@@ -464,6 +465,144 @@ static int run_camera_preprocess_validation(void) {
     return 1;
 }
 
+static int run_dvs_encoder_validation(void) {
+    printf("⚡ [Validação Pseudo-DVS ΔFrame Encoder (Zero Malloc)]:\n");
+
+    static dvs_encoder_state_t dvs_state;
+    static int8_t frame_a[DVS_FRAME_BYTES];
+    static int8_t frame_b[DVS_FRAME_BYTES];
+    static int8_t evt_out[DVS_FRAME_BYTES];
+
+    /* Frame A: padrão base [0..127] */
+    for (int i = 0; i < DVS_FRAME_BYTES; ++i) {
+        frame_a[i] = static_cast<int8_t>((i * 7) % 64 + 20);
+    }
+    /* Frame B: metade superior com +30 (ON), parte inferior com -25 (OFF) */
+    for (int i = 0; i < DVS_FRAME_BYTES; ++i) {
+        if (i < 512) {
+            frame_b[i] = static_cast<int8_t>(frame_a[i] + 30);
+        } else if (i >= DVS_FRAME_PLANE && i < DVS_FRAME_PLANE + 512) {
+            frame_b[i] = static_cast<int8_t>(frame_a[i] - 25);
+        } else if (i >= 2 * DVS_FRAME_PLANE && i < 2 * DVS_FRAME_PLANE + 256) {
+            frame_b[i] = static_cast<int8_t>(frame_a[i] + 3); /* Abaixo do threshold=8 */
+        } else {
+            frame_b[i] = frame_a[i];
+        }
+    }
+
+    int checks_passed = 0;
+    int checks_total = 0;
+    dvs_frame_stats_t stats;
+
+    /* 1. DVS_MODE_SIGNED_DELTA (binário): init -> estático -> movimento -> retorno estático */
+    dvs_encoder_cfg_t cfg_sd = dvs_encoder_default_cfg(DVS_MODE_SIGNED_DELTA);
+    dvs_encoder_init(&dvs_state, &cfg_sd);
+
+    /* 1º frame (init) */
+    dvs_encoder_process(&dvs_state, frame_a, evt_out, &stats);
+    bool sd_init_ok = (stats.on_events == 0 && stats.off_events == 0 &&
+                       stats.sparsity == 1.0f && stats.is_static_frame &&
+                       stats.total_sites == DVS_FRAME_BYTES);
+    for (int i = 0; i < DVS_FRAME_BYTES && sd_init_ok; ++i) {
+        if (evt_out[i] != 0) sd_init_ok = false;
+    }
+
+    /* 2º frame idêntico -> estático */
+    dvs_encoder_process(&dvs_state, frame_a, evt_out, &stats);
+    bool sd_static_ok = (stats.on_events == 0 && stats.off_events == 0 &&
+                         stats.sparsity == 1.0f && stats.is_static_frame);
+
+    /* 3º frame com movimento -> 512 ON (+127), 512 OFF (-127), sub-threshold ignorado */
+    dvs_encoder_process(&dvs_state, frame_b, evt_out, &stats);
+    bool sd_motion_ok = (stats.on_events == 512 && stats.off_events == 512 &&
+                         !stats.is_static_frame && stats.sparsity < 1.0f);
+    for (int i = 0; i < 512 && sd_motion_ok; ++i) {
+        if (evt_out[i] != 127) sd_motion_ok = false;
+    }
+    for (int i = DVS_FRAME_PLANE; i < DVS_FRAME_PLANE + 512 && sd_motion_ok; ++i) {
+        if (evt_out[i] != -127) sd_motion_ok = false;
+    }
+    for (int i = 2 * DVS_FRAME_PLANE; i < 2 * DVS_FRAME_PLANE + 256 && sd_motion_ok; ++i) {
+        if (evt_out[i] != 0) sd_motion_ok = false;
+    }
+
+    /* 4º frame igual ao 3º -> referência atualizada para sítios disparados, volta a 100% esparso */
+    dvs_encoder_process(&dvs_state, frame_b, evt_out, &stats);
+    bool sd_settled_ok = (stats.on_events == 0 && stats.off_events == 0 &&
+                          stats.sparsity == 1.0f && stats.is_static_frame);
+
+    checks_total++;
+    if (sd_init_ok && sd_static_ok && sd_motion_ok && sd_settled_ok) checks_passed++;
+
+    /* 2. DVS_MODE_SIGNED_DELTA (contínuo, binary_events=false) */
+    cfg_sd.binary_events = false;
+    dvs_encoder_init(&dvs_state, &cfg_sd);
+    dvs_encoder_process(&dvs_state, frame_a, evt_out, &stats);
+    dvs_encoder_process(&dvs_state, frame_b, evt_out, &stats);
+    bool sd_cont_ok = (stats.on_events == 512 && stats.off_events == 512 &&
+                       evt_out[0] == 30 && evt_out[DVS_FRAME_PLANE] == -25);
+    checks_total++;
+    if (sd_cont_ok) checks_passed++;
+
+    /* 3. DVS_MODE_ON_OFF_LUMA: init -> estático -> movimento -> settle -> snn_engine_infer */
+    /* Para ON_OFF_LUMA, variamos todos os 3 canais igualmente em 2 regiões distintas para garantir delta de Y */
+    static int8_t luma_b[DVS_FRAME_BYTES];
+    for (int p = 0; p < DVS_FRAME_PLANE; ++p) {
+        int8_t delta = 0;
+        if (p < 128) delta = 30;        /* ON */
+        else if (p < 256) delta = -20;  /* OFF */
+        luma_b[p] = static_cast<int8_t>(frame_a[p] + delta);
+        luma_b[DVS_FRAME_PLANE + p] = static_cast<int8_t>(frame_a[DVS_FRAME_PLANE + p] + delta);
+        luma_b[2 * DVS_FRAME_PLANE + p] = static_cast<int8_t>(frame_a[2 * DVS_FRAME_PLANE + p] + delta);
+    }
+
+    dvs_encoder_cfg_t cfg_luma = dvs_encoder_default_cfg(DVS_MODE_ON_OFF_LUMA);
+    dvs_encoder_init(&dvs_state, &cfg_luma);
+
+    dvs_encoder_process(&dvs_state, frame_a, evt_out, &stats);
+    bool luma_init_ok = (stats.total_sites == DVS_FRAME_PLANE && stats.is_static_frame && stats.sparsity == 1.0f);
+
+    dvs_encoder_process(&dvs_state, frame_a, evt_out, &stats);
+    bool luma_static_ok = (stats.on_events == 0 && stats.off_events == 0 && stats.is_static_frame);
+
+    dvs_encoder_process(&dvs_state, luma_b, evt_out, &stats);
+    bool luma_motion_ok = (stats.on_events == 128 && stats.off_events == 128 && !stats.is_static_frame);
+    for (int p = 0; p < 128 && luma_motion_ok; ++p) {
+        if (evt_out[p] != 127 || evt_out[DVS_FRAME_PLANE + p] != 0 || evt_out[2 * DVS_FRAME_PLANE + p] != 0) {
+            luma_motion_ok = false;
+        }
+    }
+    for (int p = 128; p < 256 && luma_motion_ok; ++p) {
+        if (evt_out[p] != 0 || evt_out[DVS_FRAME_PLANE + p] != 127 || evt_out[2 * DVS_FRAME_PLANE + p] != 0) {
+            luma_motion_ok = false;
+        }
+    }
+
+    SNNInferenceResult dvs_snn_res;
+    snn_engine_infer(reinterpret_cast<const uint8_t*>(evt_out), &dvs_snn_res);
+    bool luma_snn_ok = (dvs_snn_res.predicted_class >= 0 &&
+                        dvs_snn_res.predicted_class < SPIKEVISION_NUM_CLASSES &&
+                        dvs_snn_res.timesteps_executed == SPIKEVISION_TIMESTEPS);
+
+    dvs_encoder_process(&dvs_state, luma_b, evt_out, &stats);
+    bool luma_settled_ok = (stats.on_events == 0 && stats.off_events == 0 &&
+                            stats.sparsity == 1.0f && stats.is_static_frame);
+
+    checks_total++;
+    if (luma_init_ok && luma_static_ok && luma_motion_ok && luma_snn_ok && luma_settled_ok) {
+        checks_passed++;
+    }
+
+    if (checks_passed == checks_total) {
+        printf("  • Testes Pseudo-DVS (SIGNED_DELTA + ON_OFF_LUMA + SNN): \033[32m%d/%d PASS\033[0m (classe=%d, sparsity=%.1f%%)\n\n",
+               checks_passed, checks_total, dvs_snn_res.predicted_class, stats.sparsity * 100.0f);
+        return 0;
+    }
+
+    printf("  • Testes Pseudo-DVS: \033[31m%d/%d FALHA\033[0m\n\n", checks_passed, checks_total);
+    return 1;
+}
+
 #if defined(ESP_PLATFORM)
 extern "C" void app_main(void) {
     print_banner();
@@ -473,6 +612,7 @@ extern "C" void app_main(void) {
     run_pipeline_validation();
     run_early_exit_benchmark();
     run_camera_preprocess_validation();
+    run_dvs_encoder_validation();
 
     ESP_LOGI(TAG, "SpikeVision-S3 Neuromorphic Engine executado com sucesso.");
     vTaskDelay(pdMS_TO_TICKS(1000));
@@ -488,6 +628,7 @@ int main(int argc, char** argv) {
     int pipe_rc = run_pipeline_validation();
     int ee_rc = run_early_exit_benchmark();
     int cam_rc = run_camera_preprocess_validation();
-    return (rc != 0 || pipe_rc != 0 || ee_rc != 0 || cam_rc != 0) ? 1 : 0;
+    int dvs_rc = run_dvs_encoder_validation();
+    return (rc != 0 || pipe_rc != 0 || ee_rc != 0 || cam_rc != 0 || dvs_rc != 0) ? 1 : 0;
 }
 #endif

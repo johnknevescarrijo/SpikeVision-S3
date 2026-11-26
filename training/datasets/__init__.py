@@ -11,6 +11,11 @@ from .cifar10_cat import (
     CIFAR10_CAT_LABEL,
     CIFAR10_CLASS_NAMES,
 )
+from .dvs_encoder import (
+    PseudoDVSEncoder,
+    DVSFrameStats,
+    generate_saccade_sequence,
+)
 
 __all__ = [
     "BinaryCatCIFAR10",
@@ -20,4 +25,7 @@ __all__ = [
     "get_cifar10_multiclass_dataloaders",
     "CIFAR10_CAT_LABEL",
     "CIFAR10_CLASS_NAMES",
+    "PseudoDVSEncoder",
+    "DVSFrameStats",
+    "generate_saccade_sequence",
 ]
