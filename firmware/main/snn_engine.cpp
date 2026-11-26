@@ -123,7 +123,63 @@ size_t snn_engine_get_sram_usage(void) {
            sizeof(s_mem4) + sizeof(s_spk_counts);
 }
 
+static inline bool should_early_exit(
+    int32_t timesteps_done,
+    int32_t total_timesteps,
+    const int32_t* spk_counts,
+    const snn_early_exit_cfg_t* cfg) {
+    if (!cfg || !cfg->enabled) {
+        return false;
+    }
+    int32_t remaining = total_timesteps - timesteps_done;
+    if (remaining <= 0) {
+        return false;
+    }
+    int32_t min_t = (cfg->min_timesteps < 1) ? 1 : cfg->min_timesteps;
+    if (timesteps_done < min_t) {
+        return false;
+    }
+
+    int32_t top1 = spk_counts[0];
+    int32_t top2 = (FC_OUT_FEATURES > 1) ? spk_counts[1] : 0;
+    if (FC_OUT_FEATURES > 1 && top2 > top1) {
+        int32_t tmp = top1;
+        top1 = top2;
+        top2 = tmp;
+    }
+    for (int c = 2; c < FC_OUT_FEATURES; ++c) {
+        int32_t s = spk_counts[c];
+        if (s > top1) {
+            top2 = top1;
+            top1 = s;
+        } else if (s > top2) {
+            top2 = s;
+        }
+    }
+
+    int32_t gap = top1 - top2;
+    if (cfg->margin > 0) {
+        return gap >= cfg->margin;
+    }
+    /* Modo lossless matemático: impossível a 2ª classe alcançar a líder nos timesteps restantes */
+    return gap > remaining;
+}
+
 void snn_engine_infer(const uint8_t* image_chw, SNNInferenceResult* result) {
+    snn_engine_infer_adaptive(image_chw, result, nullptr);
+}
+
+void snn_infer_adaptive(
+    const uint8_t* image_chw,
+    SNNInferenceResult* result,
+    const snn_early_exit_cfg_t* early_exit_cfg) {
+    snn_engine_infer_adaptive(image_chw, result, early_exit_cfg);
+}
+
+void snn_engine_infer_adaptive(
+    const uint8_t* image_chw,
+    SNNInferenceResult* result,
+    const snn_early_exit_cfg_t* early_exit_cfg) {
     if (!image_chw || !result) {
         return;
     }
@@ -194,7 +250,10 @@ void snn_engine_infer(const uint8_t* image_chw, SNNInferenceResult* result) {
     }
 
     /* 4. LOOP TEMPORAL NEUROMÓRFICO (T = 8 Timesteps) */
+    int32_t timesteps_executed = 0;
+    bool early_exited = false;
     for (int t = 0; t < SPIKEVISION_TIMESTEPS; t++) {
+        timesteps_executed = t + 1;
 
         /* --- CAMADA 1: Leaky LIF (16 x 16 x 16) --- */
         for (int och = 0; och < CONV1_OUT_CHANNELS; och++) {
@@ -378,6 +437,11 @@ void snn_engine_infer(const uint8_t* image_chw, SNNInferenceResult* result) {
             s_spk_counts[c] += s;
             total_spks_l4 += s;
         }
+
+        if (should_early_exit(timesteps_executed, SPIKEVISION_TIMESTEPS, s_spk_counts, early_exit_cfg)) {
+            early_exited = true;
+            break;
+        }
     }
 
     /* 5. Decisão de Classificação: Maior contagem de spikes (desempate por maior potencial final de membrana) */
@@ -415,14 +479,8 @@ void snn_engine_infer(const uint8_t* image_chw, SNNInferenceResult* result) {
     result->total_spikes_l4 = total_spks_l4;
     result->total_spikes = total_spks_l1 + total_spks_l2 + total_spks_l3 + total_spks_l4;
 
-    /* Total de avaliações de neurônios:
-     * L1: 4096 * T
-     * L2: 2048 * T
-     * L3:  512 * T
-     * L4: FC_OUT_FEATURES * T
-     * Total = (6656 + FC_OUT_FEATURES) * SPIKEVISION_TIMESTEPS
-     */
-    const uint32_t total_neurons = (6656 + FC_OUT_FEATURES) * SPIKEVISION_TIMESTEPS;
+    /* Total de avaliações de neurônios nos timesteps efetivamente executados */
+    const uint32_t total_neurons = (6656 + FC_OUT_FEATURES) * (uint32_t)timesteps_executed;
     result->sparsity_percent = 100.0f * (1.0f - ((float)result->total_spikes / (float)total_neurons));
 
     /* Total de MACs densos equivalentes:
@@ -439,4 +497,6 @@ void snn_engine_infer(const uint8_t* image_chw, SNNInferenceResult* result) {
     /* Redução de operações: consideramos que em L1 foram 442.368 MACs e nas demais apenas active_sops */
     uint64_t total_ops = active_sops + 442368ULL;
     result->sop_reduction_percent = 100.0f * (1.0f - ((float)total_ops / (float)dense_macs));
+    result->timesteps_executed = timesteps_executed;
+    result->early_exited = early_exited;
 }

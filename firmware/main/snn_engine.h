@@ -10,6 +10,15 @@ extern "C" {
 #endif
 
 /**
+ * Configuração do mecanismo de Early-Exit Temporal (Inferência Adaptativa).
+ */
+typedef struct {
+    bool enabled;           /**< Habilita (true) ou desabilita (false) o early-exit temporal */
+    int32_t min_timesteps;  /**< Número mínimo de timesteps antes de avaliar saída (padrão: 2, mínimo: 1) */
+    int32_t margin;         /**< >0: sai se (top1 - top2) >= margin; ==0: modo lossless (top1 - top2) > remaining */
+} snn_early_exit_cfg_t;
+
+/**
  * Estrutura contendo o resultado completo e as métricas de inferência da CSNN.
  */
 typedef struct {
@@ -33,6 +42,10 @@ typedef struct {
     /* Benchmarks de tempo e ciclos de clock */
     uint64_t latency_us;          /**< Tempo total de inferência em microssegundos */
     uint32_t cpu_cycles;          /**< Ciclos de CPU consumidos (ESP32-S3) */
+
+    /* Métricas de execução adaptativa (Early-Exit Temporal) */
+    int32_t timesteps_executed;   /**< Número de timesteps efetivamente executados [1 .. SPIKEVISION_TIMESTEPS] */
+    bool early_exited;            /**< true se a inferência encerrou antes de SPIKEVISION_TIMESTEPS */
 } SNNInferenceResult;
 
 /**
@@ -47,6 +60,26 @@ void snn_engine_init(void);
  * @param result    Estrutura onde os resultados, predição e benchmarks serão gravados.
  */
 void snn_engine_infer(const uint8_t* image_chw, SNNInferenceResult* result);
+
+/**
+ * Executa a inferência adaptativa da SNN com suporte a Early-Exit Temporal.
+ *
+ * @param image_chw      Ponteiro para os dados da imagem em formato plano CHW (3 * 32 * 32 bytes).
+ * @param result         Estrutura onde os resultados, predição e benchmarks serão gravados.
+ * @param early_exit_cfg Configuração de early-exit (nullptr desabilita e executa todos os T timesteps).
+ */
+void snn_engine_infer_adaptive(
+    const uint8_t* image_chw,
+    SNNInferenceResult* result,
+    const snn_early_exit_cfg_t* early_exit_cfg);
+
+/**
+ * Alias de compatibilidade para snn_engine_infer_adaptive.
+ */
+void snn_infer_adaptive(
+    const uint8_t* image_chw,
+    SNNInferenceResult* result,
+    const snn_early_exit_cfg_t* early_exit_cfg);
 
 /**
  * Retorna o consumo total de memória estática (SRAM) alocada pelos buffers do motor.
