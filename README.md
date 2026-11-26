@@ -426,6 +426,27 @@ idf.py -p /dev/ttyACM0 flash monitor
 
 ---
 
+## ⚡ Neuromorphic Runtime, Hardware & Tooling Capabilities
+
+* **Direct Coding & Sparsity Regularization:** `SpikeVisionCSNN` defaults to `encoding="direct"` with optional L1 / target-rate firing regularization (`--sparsity-weight`, `--target-rate`) across `ce_rate`, `ce_mem`, and `mse_count` losses.
+* **Per-Channel Int8 Quantization & QAT:** Supports symmetric per-channel (`axis=0`) Int8 quantization and Straight-Through Estimator (STE) Quantization-Aware Training (`--qat`).
+* **Temporal Early-Exit:** Adaptive inference (`snn_engine_infer_adaptive`) supporting lossless (`margin=0`) and margin-based early termination to skip redundant timesteps and SOPs.
+* **74.89 KB Static SRAM & Spike Bit-Packing:** Shared postsynaptic current scratchpad and 1-bit-per-neuron packed spike buffers (`76,688` bytes total static SRAM, zero heap allocation).
+* **SIMD & Dual-Core FreeRTOS Pipeline:** Accelerated inner loops (`ESP-DSP` / `Xtensa LX7 PIE` / `Scalar C++17`) and asynchronous producer-consumer inference (`snn_pipeline`).
+* **Camera & Pseudo-DVS `ΔFrame`:** Native `OV2640`/`OV5640` capture (`RGB565`/`RGB888`/`Gray8` -> `32×32` CHW `[0..127]`) and zero-malloc temporal difference encoding (`SIGNED_DELTA` and `ON_OFF_LUMA`).
+* **Serial / USB-CDC & Web Dashboard:** CRC16-CCITT binary framing (`tools/serial_client.py`) and local HTTP dashboard (`tools/dashboard/server.py`) compatible with both ESP32-S3 hardware and `--host-bin`.
+* **Automated Testing & CI:** Cross-verified `pytest` / `unittest` suite (`tests/`) and GitHub Actions workflow ([`.github/workflows/ci.yml`](.github/workflows/ci.yml)).
+
+```bash
+# Run automated Python + Host C++ E2E test suite
+pytest -v
+
+# Launch local Web Dashboard against the host simulator
+python3 tools/dashboard/server.py --host-bin firmware/build_host/spikevision_s3_host
+```
+
+---
+
 ## 🛠️ Technologies & Tools
 
 * **Languages:** Python 3.10+, C/C++ (C++17)

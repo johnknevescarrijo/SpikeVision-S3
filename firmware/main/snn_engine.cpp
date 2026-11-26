@@ -144,6 +144,18 @@ size_t snn_engine_get_sram_usage(void) {
     return snn_engine_get_sram_bytes();
 }
 
+size_t snn_engine_get_rom_bytes(void) {
+    size_t total = sizeof(conv1_weights) + sizeof(conv1_bias) +
+                   sizeof(conv2_weights) + sizeof(conv2_bias) +
+                   sizeof(conv3_weights) + sizeof(conv3_bias) +
+                   sizeof(fc_weights) + sizeof(fc_bias);
+#ifdef SPIKEVISION_PER_CHANNEL_QUANT
+    total += sizeof(VTH_L1_CH) + sizeof(VTH_L2_CH) +
+             sizeof(VTH_L3_CH) + sizeof(VTH_FC_CH);
+#endif
+    return total;
+}
+
 const char* snn_engine_get_simd_backend(void) {
     return snn_simd_backend_name();
 }
@@ -543,23 +555,30 @@ void snn_engine_infer_adaptive(
     result->total_spikes = total_spks_l1 + total_spks_l2 + total_spks_l3 + total_spks_l4;
 
     /* Total de avaliações de neurônios nos timesteps efetivamente executados */
-    const uint32_t total_neurons = (6656 + FC_OUT_FEATURES) * (uint32_t)timesteps_executed;
+    constexpr uint32_t kHiddenNeurons = L1_SPK_ELEMS + L2_SPK_ELEMS + L3_SPK_ELEMS;
+    const uint32_t total_neurons = (kHiddenNeurons + FC_OUT_FEATURES) * (uint32_t)timesteps_executed;
     result->sparsity_percent = 100.0f * (1.0f - ((float)result->total_spikes / (float)total_neurons));
 
-    /* Total de MACs densos equivalentes:
-     * L1: 16 * 32 * 32 * (3 * 3 * 3) = 442.368 (feita 1x)
-     * L2: T * (32 * 16 * 16) * (16 * 3 * 3) = 9.437.184
-     * L3: T * (32 * 8 * 8) * (32 * 3 * 3) = 4.718.592
-     * L4: T * FC_IN_FEATURES * FC_OUT_FEATURES
-     * Camadas 1..3 = 14.598.144
-     */
-    const uint64_t dense_macs = 14598144ULL + ((uint64_t)SPIKEVISION_TIMESTEPS * FC_IN_FEATURES * FC_OUT_FEATURES);
-    result->dense_macs = dense_macs;
+    /* Total de MACs densos equivalentes derivados da topologia em weights.h */
+    constexpr uint64_t kL1DenseMacs =
+        (uint64_t)CONV1_OUT_CHANNELS * SPIKEVISION_INPUT_HEIGHT * SPIKEVISION_INPUT_WIDTH *
+        CONV1_IN_CHANNELS * CONV1_KERNEL_SIZE * CONV1_KERNEL_SIZE;
+    constexpr uint64_t kL2DenseMacs =
+        (uint64_t)SPIKEVISION_TIMESTEPS * CONV2_OUT_CHANNELS * POOL1_OUT_H * POOL1_OUT_W *
+        CONV2_IN_CHANNELS * CONV2_KERNEL_SIZE * CONV2_KERNEL_SIZE;
+    constexpr uint64_t kL3DenseMacs =
+        (uint64_t)SPIKEVISION_TIMESTEPS * CONV3_OUT_CHANNELS * POOL2_OUT_H * POOL2_OUT_W *
+        CONV3_IN_CHANNELS * CONV3_KERNEL_SIZE * CONV3_KERNEL_SIZE;
+    constexpr uint64_t kL4DenseMacs =
+        (uint64_t)SPIKEVISION_TIMESTEPS * FC_IN_FEATURES * FC_OUT_FEATURES;
+    constexpr uint64_t kDenseMacs = kL1DenseMacs + kL2DenseMacs + kL3DenseMacs + kL4DenseMacs;
+
+    result->dense_macs = kDenseMacs;
     result->active_sops = active_sops;
 
-    /* Redução de operações: consideramos que em L1 foram 442.368 MACs e nas demais apenas active_sops */
-    uint64_t total_ops = active_sops + 442368ULL;
-    result->sop_reduction_percent = 100.0f * (1.0f - ((float)total_ops / (float)dense_macs));
+    /* Redução de operações: em L1 executamos kL1DenseMacs (1x) e nas demais apenas active_sops */
+    uint64_t total_ops = active_sops + kL1DenseMacs;
+    result->sop_reduction_percent = 100.0f * (1.0f - ((float)total_ops / (float)kDenseMacs));
     result->timesteps_executed = timesteps_executed;
     result->early_exited = early_exited;
 }

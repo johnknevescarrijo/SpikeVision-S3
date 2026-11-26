@@ -24,8 +24,15 @@ training/data/
 build/
 firmware/build/
 firmware/build_host/
+firmware/managed_components/
 firmware/sdkconfig
 firmware/sdkconfig.old
 firmware/dependencies.lock
 .pio/
 .pioenvs/
+
+# Tests & local artifacts
+.pytest_cache/
+papers/
+training/checkpoints/dadosm.json
+training/checkpoints/latest_full_results.json
