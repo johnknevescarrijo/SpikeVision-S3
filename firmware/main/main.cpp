@@ -10,6 +10,7 @@
 #include <inttypes.h>
 #include <stdbool.h>
 #include "snn_engine.h"
+#include "snn_pipeline.h"
 #include "test_samples.h"
 
 #if defined(ESP_PLATFORM)
@@ -57,6 +58,7 @@ static void print_system_info(void) {
     printf("  • Modo de Operação:     Validação Bit-a-Bit Cruzada\n");
 #endif
     const size_t sram_bytes = snn_engine_get_sram_bytes();
+    printf("  • Backend SIMD:         %s\n", snn_engine_get_simd_backend());
     printf("  • Consumo SRAM Motor:   %zu bytes (%.2f KB) [100%% Estática, 0 Heap]\n",
            sram_bytes, (float)sram_bytes / 1024.0f);
     printf("  • Ocupação ROM Pesos:   15608 bytes (15.24 KB)\n\n");
@@ -240,12 +242,78 @@ static int run_early_exit_benchmark(void) {
     return status;
 }
 
+static int run_pipeline_validation(void) {
+    printf("🔄 [Validação do Pipeline Assíncrono (Dual-Core / Worker Thread) - %d Amostras]:\n", TEST_SAMPLE_COUNT);
+
+    uint64_t expected_sops[TEST_SAMPLE_COUNT];
+    for (int i = 0; i < TEST_SAMPLE_COUNT; i++) {
+        SNNInferenceResult sync_res;
+        snn_engine_infer(TEST_SUITE[i].image_data, &sync_res);
+        expected_sops[i] = sync_res.active_sops;
+    }
+
+    if (!snn_pipeline_start(nullptr)) {
+        printf("\033[31m✘ FALHA: Não foi possível iniciar o pipeline assíncrono.\033[0m\n\n");
+        return 1;
+    }
+
+    int matches = 0;
+    int submitted = 0;
+    int received = 0;
+
+    /* Preenche até a profundidade da fila e drena em pipeline para exercitar concorrência */
+    while (received < TEST_SAMPLE_COUNT) {
+        while (submitted < TEST_SAMPLE_COUNT && (submitted - received) < SNN_PIPELINE_QUEUE_DEPTH) {
+            if (!snn_pipeline_submit((uint32_t)submitted, (const int8_t*)TEST_SUITE[submitted].image_data, 5000)) {
+                printf("\033[31m✘ FALHA: Timeout ao submeter frame %d no pipeline.\033[0m\n", submitted);
+                snn_pipeline_stop();
+                return 1;
+            }
+            submitted++;
+        }
+
+        snn_pipeline_output_t out;
+        if (!snn_pipeline_receive(&out, 5000)) {
+            printf("\033[31m✘ FALHA: Timeout ao receber frame %d do pipeline.\033[0m\n", received);
+            snn_pipeline_stop();
+            return 1;
+        }
+
+        const SNNTestCase* tc = &TEST_SUITE[received];
+        bool ok = (out.frame_id == (uint32_t)received) &&
+                  (out.result.predicted_class == tc->expected_prediction) &&
+                  (out.result.active_sops == expected_sops[received]);
+        for (int c = 0; c < SPIKEVISION_NUM_CLASSES; ++c) {
+            if (out.result.spike_counts[c] != tc->expected_spikes[c] ||
+                out.result.final_mem[c] != tc->expected_mem[c]) {
+                ok = false;
+            }
+        }
+        if (ok) {
+            matches++;
+        }
+        received++;
+    }
+
+    snn_pipeline_stop();
+
+    if (matches == TEST_SAMPLE_COUNT) {
+        printf("  • Paridade Assíncrona (frame_id, pred, spikes, SOPs): \033[32m%d/%d (100%%)\033[0m\n\n",
+               matches, TEST_SAMPLE_COUNT);
+        return 0;
+    }
+
+    printf("  • Paridade Assíncrona: \033[31m%d/%d FALHA\033[0m\n\n", matches, TEST_SAMPLE_COUNT);
+    return 1;
+}
+
 #if defined(ESP_PLATFORM)
 extern "C" void app_main(void) {
     print_banner();
     print_system_info();
     snn_engine_init();
     run_validation_suite();
+    run_pipeline_validation();
     run_early_exit_benchmark();
 
     ESP_LOGI(TAG, "SpikeVision-S3 Neuromorphic Engine executado com sucesso.");
@@ -259,7 +327,8 @@ int main(int argc, char** argv) {
     print_system_info();
     snn_engine_init();
     int rc = run_validation_suite();
+    int pipe_rc = run_pipeline_validation();
     int ee_rc = run_early_exit_benchmark();
-    return (rc != 0 || ee_rc != 0) ? 1 : 0;
+    return (rc != 0 || pipe_rc != 0 || ee_rc != 0) ? 1 : 0;
 }
 #endif
