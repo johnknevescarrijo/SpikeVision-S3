@@ -67,6 +67,9 @@ class SpikeVisionCSNN(nn.Module):
         self.fc = nn.Linear(32 * 4 * 4, num_classes, bias=False)
         self.lif4 = snn.Leaky(beta=beta, spike_grad=spike_grad, init_hidden=False)
 
+        # Armazena spikes das camadas ocultas do último forward para regularização de esparsidade
+        self.last_hidden_spikes: Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = None
+
     def init_membrane_potentials(
         self, batch_size: int, device: torch.device
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -81,7 +84,7 @@ class SpikeVisionCSNN(nn.Module):
         self,
         x: torch.Tensor,
         num_steps: int = 8,
-        encoding: str = "rate",
+        encoding: str = "direct",
         return_sparsity: bool = True,
     ) -> Union[Tuple[torch.Tensor, torch.Tensor], Tuple[torch.Tensor, torch.Tensor, Dict[str, float]]]:
         """
@@ -115,6 +118,9 @@ class SpikeVisionCSNN(nn.Module):
 
         spk_out_rec = []
         mem_out_rec = []
+        spk1_rec = []
+        spk2_rec = []
+        spk3_rec = []
 
         # Contadores para estatísticas de esparsidade
         spk_count_l1 = 0
@@ -142,6 +148,9 @@ class SpikeVisionCSNN(nn.Module):
             cur4 = self.fc(flat)
             spk4, mem4 = self.lif4(cur4, mem4)
 
+            spk1_rec.append(spk1)
+            spk2_rec.append(spk2)
+            spk3_rec.append(spk3)
             spk_out_rec.append(spk4)
             mem_out_rec.append(mem4)
 
@@ -151,6 +160,11 @@ class SpikeVisionCSNN(nn.Module):
                 spk_count_l3 += spk3.detach().sum().item()
                 spk_count_l4 += spk4.detach().sum().item()
 
+        self.last_hidden_spikes = (
+            torch.stack(spk1_rec, dim=0),
+            torch.stack(spk2_rec, dim=0),
+            torch.stack(spk3_rec, dim=0),
+        )
         spk_out = torch.stack(spk_out_rec, dim=0)  # [T, B, num_classes]
         mem_out = torch.stack(mem_out_rec, dim=0)  # [T, B, num_classes]
 
@@ -181,6 +195,20 @@ class SpikeVisionCSNN(nn.Module):
         }
 
         return spk_out, mem_out, sparsity_dict
+
+    def compute_firing_rate_loss(self, target_rate: Optional[float] = None) -> torch.Tensor:
+        """
+        Calcula a perda de regularização de esparsidade (L1 ou L1 em torno de target_rate)
+        sobre os spikes das camadas ocultas (spk1, spk2, spk3) do último forward.
+        """
+        device = next(self.parameters()).device
+        if self.last_hidden_spikes is None:
+            return torch.tensor(0.0, device=device)
+
+        mean_rate = torch.stack([s.mean() for s in self.last_hidden_spikes]).mean()
+        if target_rate is None:
+            return mean_rate
+        return torch.abs(mean_rate - target_rate)
 
 
 def count_parameters(model: nn.Module) -> Dict[str, Any]:

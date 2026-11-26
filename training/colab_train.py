@@ -66,6 +66,9 @@ CONFIG = {
     "beta": 0.9,             # Fator de decaimento do neurônio Leaky LIF
     "slope": 25.0,           # Inclinação do gradiente substituto FastSigmoid
     "encoding": "direct",    # 'direct' (recomendado, alta acurácia) ou 'rate'
+    "loss_type": "ce_rate",  # 'ce_rate', 'ce_mem' ou 'mse_count'
+    "sparsity_weight": 0.0,  # Peso da regularização de esparsidade (firing rate)
+    "target_rate": None,     # Taxa alvo opcional (None = L1 em direção a 0)
     "in_channels": 3,        # 3 para RGB (ou 1 para escala de cinza)
     "num_classes": 10,       # 10 classes completas do CIFAR-10
 
@@ -344,6 +347,7 @@ class SpikeVisionCSNN(nn.Module):
         self.flatten = nn.Flatten()
         self.fc = nn.Linear(32 * 4 * 4, num_classes, bias=False)
         self.lif4 = snn.Leaky(beta=beta, spike_grad=spike_grad, init_hidden=False)
+        self.last_hidden_spikes: Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = None
 
     def init_membrane_potentials(
         self, batch_size: int, device: torch.device
@@ -379,6 +383,9 @@ class SpikeVisionCSNN(nn.Module):
 
         spk_out_rec = []
         mem_out_rec = []
+        spk1_rec = []
+        spk2_rec = []
+        spk3_rec = []
 
         spk_count_l1 = 0
         spk_count_l2 = 0
@@ -405,6 +412,9 @@ class SpikeVisionCSNN(nn.Module):
             cur4 = self.fc(flat)
             spk4, mem4 = self.lif4(cur4, mem4)
 
+            spk1_rec.append(spk1)
+            spk2_rec.append(spk2)
+            spk3_rec.append(spk3)
             spk_out_rec.append(spk4)
             mem_out_rec.append(mem4)
 
@@ -414,6 +424,11 @@ class SpikeVisionCSNN(nn.Module):
                 spk_count_l3 += spk3.detach().sum().item()
                 spk_count_l4 += spk4.detach().sum().item()
 
+        self.last_hidden_spikes = (
+            torch.stack(spk1_rec, dim=0),
+            torch.stack(spk2_rec, dim=0),
+            torch.stack(spk3_rec, dim=0),
+        )
         spk_out = torch.stack(spk_out_rec, dim=0)
         mem_out = torch.stack(mem_out_rec, dim=0)
 
@@ -440,6 +455,16 @@ class SpikeVisionCSNN(nn.Module):
 
         return spk_out, mem_out, sparsity_dict
 
+    def compute_firing_rate_loss(self, target_rate: Optional[float] = None) -> torch.Tensor:
+        """Calcula a regularização de esparsidade sobre os spikes das camadas ocultas."""
+        device = next(self.parameters()).device
+        if self.last_hidden_spikes is None:
+            return torch.tensor(0.0, device=device)
+        mean_rate = torch.stack([s.mean() for s in self.last_hidden_spikes]).mean()
+        if target_rate is None:
+            return mean_rate
+        return torch.abs(mean_rate - target_rate)
+
 
 def print_model_summary(model: nn.Module):
     """Exibe um sumário legível da arquitetura e ocupação estimada na SRAM."""
@@ -464,6 +489,31 @@ def print_model_summary(model: nn.Module):
 # ==============================================================================
 # LOOP DE TREINO E AVALIAÇÃO
 # ==============================================================================
+def build_loss_fn(loss_type: str) -> nn.Module:
+    """Constrói a função de perda temporal SNN a partir do identificador."""
+    if loss_type == "ce_rate":
+        return SF.ce_rate_loss()
+    if loss_type == "ce_mem":
+        mem_loss_cls = getattr(SF, "ce_mem_loss", SF.ce_max_membrane_loss)
+        return mem_loss_cls()
+    if loss_type == "mse_count":
+        return SF.mse_count_loss(correct_rate=0.8, incorrect_rate=0.2)
+    raise ValueError(f"Função de perda desconhecida: {loss_type}")
+
+
+def compute_temporal_loss(
+    criterion: nn.Module,
+    loss_type: str,
+    spk_out: torch.Tensor,
+    mem_out: torch.Tensor,
+    targets: torch.Tensor,
+) -> torch.Tensor:
+    """Aplica a loss temporal selecionada sobre spikes ou potenciais de membrana."""
+    if loss_type == "ce_mem":
+        return criterion(mem_out, targets)
+    return criterion(spk_out, targets)
+
+
 def train_one_epoch(
     model: nn.Module,
     train_loader: DataLoader,
@@ -472,6 +522,9 @@ def train_one_epoch(
     device: torch.device,
     num_steps: int,
     encoding: str,
+    loss_type: str = "ce_rate",
+    sparsity_weight: float = 0.0,
+    target_rate: Optional[float] = None,
 ) -> Tuple[float, float, float]:
     """Treina uma época do modelo."""
     model.train()
@@ -490,7 +543,9 @@ def train_one_epoch(
             images, num_steps=num_steps, encoding=encoding, return_sparsity=True
         )
 
-        loss = criterion(spk_out, targets)
+        loss = compute_temporal_loss(criterion, loss_type, spk_out, mem_out, targets)
+        if sparsity_weight > 0.0:
+            loss = loss + sparsity_weight * model.compute_firing_rate_loss(target_rate=target_rate)
         loss.backward()
         optimizer.step()
 
@@ -597,6 +652,7 @@ def evaluate(
     device: torch.device,
     num_steps: int,
     encoding: str,
+    loss_type: str = "ce_rate",
     num_classes: Optional[int] = None,
 ) -> Dict[str, Any]:
     """Avalia o modelo calculando Acurácia, Macro-F1, Precisão, Recall e Esparsidade."""
@@ -621,7 +677,7 @@ def evaluate(
                 images, num_steps=num_steps, encoding=encoding, return_sparsity=True
             )
 
-            loss = criterion(spk_out, targets)
+            loss = compute_temporal_loss(criterion, loss_type, spk_out, mem_out, targets)
             total_loss += loss.item() * targets.size(0)
 
             spike_counts = spk_out.sum(dim=0)
@@ -707,14 +763,18 @@ def main():
     # 4. Otimizador, Scheduler e Loss
     optimizer = optim.Adam(model.parameters(), lr=CONFIG["lr"], weight_decay=CONFIG["weight_decay"])
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=CONFIG["epochs"], eta_min=1e-5)
-    criterion = SF.ce_rate_loss()
+    criterion = build_loss_fn(CONFIG["loss_type"])
 
     best_acc = 0.0
     best_checkpoint_path = CONFIG["checkpoint_path"]
     history = []
 
     print("\nIniciando treinamento SNN:")
-    print(f"Épocas: {CONFIG['epochs']} | Classes: {CONFIG['num_classes']} | Timesteps (T): {CONFIG['num_steps']} | Codificação: {CONFIG['encoding']} | Beta LIF: {CONFIG['beta']}\n")
+    print(
+        f"Épocas: {CONFIG['epochs']} | Classes: {CONFIG['num_classes']} | Timesteps (T): {CONFIG['num_steps']} | "
+        f"Codificação: {CONFIG['encoding']} | Loss: {CONFIG['loss_type']} | "
+        f"Sparsity Weight: {CONFIG['sparsity_weight']} | Beta LIF: {CONFIG['beta']}\n"
+    )
 
     start_total_time = time.time()
 
@@ -729,6 +789,9 @@ def main():
             device=device,
             num_steps=CONFIG["num_steps"],
             encoding=CONFIG["encoding"],
+            loss_type=CONFIG["loss_type"],
+            sparsity_weight=CONFIG["sparsity_weight"],
+            target_rate=CONFIG["target_rate"],
         )
 
         test_metrics = evaluate(
@@ -738,6 +801,7 @@ def main():
             device=device,
             num_steps=CONFIG["num_steps"],
             encoding=CONFIG["encoding"],
+            loss_type=CONFIG["loss_type"],
             num_classes=CONFIG["num_classes"],
         )
 
@@ -751,10 +815,11 @@ def main():
         macro_r = test_metrics.get("macro_recall", 0.0)
         overall_fr = test_metrics["overall_firing_rate"]
         sparsity = test_metrics["overall_sparsity"]
+        train_sparsity = 1.0 - train_fr
 
         print(
             f"Época [{epoch:02d}/{CONFIG['epochs']:02d}] ({epoch_time:4.1f}s) | "
-            f"Treino Loss: {train_loss:.4f} Acc: {train_acc*100:5.2f}% | "
+            f"Treino Loss: {train_loss:.4f} Acc: {train_acc*100:5.2f}% Esp: {train_sparsity*100:5.1f}% | "
             f"Teste Loss: {test_loss:.4f} Acc: {test_acc*100:5.2f}% | "
             f"Macro-F1: {macro_f1:.3f} (P: {macro_p:.2f}, R: {macro_r:.2f}) | "
             f"Esparsidade: {sparsity*100:5.1f}%"
@@ -765,6 +830,7 @@ def main():
             "train_loss": train_loss,
             "train_acc": train_acc,
             "train_firing_rate": train_fr,
+            "train_sparsity": train_sparsity,
             "test_loss": test_loss,
             "test_acc": test_acc,
             "test_macro_f1": macro_f1,
@@ -772,6 +838,7 @@ def main():
             "test_macro_recall": macro_r,
             "test_per_class_f1": test_metrics.get("per_class_f1", {}),
             "test_per_class_accuracy": test_metrics.get("per_class_accuracy", {}),
+            "test_firing_rate": overall_fr,
             "test_sparsity": sparsity,
             "epoch_time_sec": epoch_time,
         }
@@ -792,6 +859,9 @@ def main():
                     "slope": CONFIG["slope"],
                     "num_steps": CONFIG["num_steps"],
                     "encoding": CONFIG["encoding"],
+                    "loss_type": CONFIG["loss_type"],
+                    "sparsity_weight": CONFIG["sparsity_weight"],
+                    "target_rate": CONFIG["target_rate"],
                 },
                 "metrics": test_metrics,
             }

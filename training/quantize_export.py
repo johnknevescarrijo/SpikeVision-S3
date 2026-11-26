@@ -780,6 +780,44 @@ def analyze_memory_footprint(quant_params: Dict[str, Dict[str, Any]]) -> Dict[st
     }
 
 
+def validate_checkpoint_encoding(
+    config: Dict[str, Any],
+    allow_legacy: bool = False,
+    force_mismatch: bool = False,
+) -> str:
+    """
+    Valida o campo `encoding` do checkpoint contra o encoding 'direct' do firmware.
+
+    - Se ausente (legado): emite aviso e assume 'direct' (ou suprime o aviso se allow_legacy=True).
+    - Se presente e != 'direct': aborta com SystemExit(1), salvo se force_mismatch=True.
+    """
+    ckpt_encoding = config.get("encoding")
+    if ckpt_encoding is None:
+        if not allow_legacy:
+            logger.warning(
+                "Checkpoint legado sem campo 'encoding' em config; assumindo encoding='direct'. "
+                "(Passe --allow-legacy-checkpoint para suprimir este aviso.)"
+            )
+        config["encoding"] = "direct"
+        return "direct"
+
+    if ckpt_encoding != "direct":
+        if force_mismatch:
+            logger.warning(
+                f"Checkpoint treinado com encoding='{ckpt_encoding}', diferente de 'direct'. "
+                "Prosseguindo por --force-encoding-mismatch (risco de queda severa de acurácia)."
+            )
+            return ckpt_encoding
+        logger.error(
+            f"Incompatibilidade de encoding: checkpoint usa encoding='{ckpt_encoding}', "
+            "mas o simulador Int8 e o firmware ESP32-S3 esperam encoding='direct'. "
+            "Re-treine com --encoding direct ou passe --force-encoding-mismatch."
+        )
+        sys.exit(1)
+
+    return ckpt_encoding
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="SpikeVision-S3: Quantização Int8 e Exportação C/C++"
@@ -826,6 +864,16 @@ def main():
         default=5,
         help="Número de amostras reais por classe exportadas para validação em firmware",
     )
+    parser.add_argument(
+        "--allow-legacy-checkpoint",
+        action="store_true",
+        help="Permite checkpoints legados sem o campo 'encoding' (assume 'direct' sem aviso)",
+    )
+    parser.add_argument(
+        "--force-encoding-mismatch",
+        action="store_true",
+        help="Força exportação mesmo se o checkpoint não tiver sido treinado com encoding='direct'",
+    )
     args = parser.parse_args()
 
     print("\n" + "=" * 70)
@@ -843,6 +891,11 @@ def main():
     logger.info(f"Carregando checkpoint de: {args.checkpoint}")
     ckpt = torch.load(args.checkpoint, map_location=device)
     config = ckpt.get("config", {})
+    validate_checkpoint_encoding(
+        config,
+        allow_legacy=args.allow_legacy_checkpoint,
+        force_mismatch=args.force_encoding_mismatch,
+    )
     trained_metrics = ckpt.get("metrics", {})
     epoch = ckpt.get("epoch", 0)
 
