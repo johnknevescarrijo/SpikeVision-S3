@@ -1,0 +1,50 @@
+name: SpikeVision-S3 CI
+
+on:
+  push:
+    branches: ["main", "feature/**", "fix/**"]
+  pull_request:
+    branches: ["main"]
+
+jobs:
+  firmware-host:
+    name: Firmware Host C++17 & Serial Self-Test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install Python serial self-test dependencies
+        run: python3 -m pip install --upgrade pip && pip install numpy
+
+      - name: Build and run firmware host validation
+        run: |
+          make -C firmware clean
+          make -C firmware test
+
+      - name: Run serial protocol self-test against host binary
+        run: python3 tools/serial_client.py --host-bin firmware/build_host/spikevision_s3_host --self-test
+
+  python-tests:
+    name: Python SNN, Quantization, DVS & E2E Tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install minimal CPU dependencies
+        run: |
+          python3 -m pip install --upgrade pip
+          pip install --index-url https://download.pytorch.org/whl/cpu torch torchvision
+          pip install numpy snntorch pytest
+
+      - name: Run pytest suite
+        run: pytest -v
