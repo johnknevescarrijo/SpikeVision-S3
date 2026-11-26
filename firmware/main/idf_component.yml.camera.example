@@ -1,0 +1,5 @@
+# Para habilitar o driver físico OV2640/OV5640 no ESP32-S3:
+# 1. Renomeie este arquivo para `idf_component.yml` dentro de `firmware/main/`.
+# 2. Execute `make -C firmware idf-build` (o IDF Component Manager baixará o pacote).
+dependencies:
+  espressif/esp32-camera: "^2.0.10"
