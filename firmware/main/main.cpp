@@ -63,10 +63,12 @@ static void print_system_info(void) {
     printf("  • Modo de Operação:     Validação Bit-a-Bit Cruzada\n");
 #endif
     const size_t sram_bytes = snn_engine_get_sram_bytes();
+    const size_t rom_bytes = snn_engine_get_rom_bytes();
     printf("  • Backend SIMD:         %s\n", snn_engine_get_simd_backend());
     printf("  • Consumo SRAM Motor:   %zu bytes (%.2f KB) [100%% Estática, 0 Heap]\n",
            sram_bytes, (float)sram_bytes / 1024.0f);
-    printf("  • Ocupação ROM Pesos:   15608 bytes (15.24 KB)\n\n");
+    printf("  • Ocupação ROM Pesos:   %zu bytes (%.2f KB)\n\n",
+           rom_bytes, (float)rom_bytes / 1024.0f);
 }
 
 static const char* get_class_name(int cls) {
