@@ -7,6 +7,7 @@
  */
 
 #include "snn_engine.h"
+#include "snn_simd.h"
 #include <string.h>
 
 #if defined(ESP_PLATFORM)
@@ -71,8 +72,7 @@ static inline void spk_set(uint32_t* buf, int idx) {
  * Reproduz bit-a-bit os registradores da CPU Xtensa do ESP32-S3.
  */
 static inline int32_t lif_decay_32(int32_t mem) {
-    int32_t prod = (int32_t)((uint32_t)mem * (uint32_t)SPIKEVISION_BETA_NUM);
-    return prod >> SPIKEVISION_BETA_SHIFT;
+    return snn_simd_lif_decay_i32(mem, (uint32_t)SPIKEVISION_BETA_NUM, SPIKEVISION_BETA_SHIFT);
 }
 
 static inline int32_t vth_l1(int c) {
@@ -144,6 +144,10 @@ size_t snn_engine_get_sram_usage(void) {
     return snn_engine_get_sram_bytes();
 }
 
+const char* snn_engine_get_simd_backend(void) {
+    return snn_simd_backend_name();
+}
+
 static inline bool should_early_exit(
     int32_t timesteps_done,
     int32_t total_timesteps,
@@ -187,23 +191,26 @@ static inline bool should_early_exit(
 }
 
 static inline int32_t conv1_pixel(const uint8_t* image_chw, int och, int32_t bias, int y, int x) {
-    int32_t acc = bias;
+    int8_t patch[27];
+    int p = 0;
     for (int ich = 0; ich < CONV1_IN_CHANNELS; ich++) {
         const uint8_t* in_plane = image_chw + ich * (32 * 32);
         for (int ky = 0; ky < 3; ky++) {
             int iy = y + ky - 1;
-            if (iy < 0 || iy >= 32) continue;
+            if (iy < 0 || iy >= 32) {
+                patch[p++] = 0;
+                patch[p++] = 0;
+                patch[p++] = 0;
+                continue;
+            }
+            const uint8_t* row = in_plane + iy * 32;
             for (int kx = 0; kx < 3; kx++) {
                 int ix = x + kx - 1;
-                if (ix < 0 || ix >= 32) continue;
-
-                int8_t w = conv1_weights[((och * 3 + ich) * 3 + ky) * 3 + kx];
-                uint8_t px = in_plane[iy * 32 + ix];
-                acc += (int32_t)px * (int32_t)w;
+                patch[p++] = (ix < 0 || ix >= 32) ? 0 : (int8_t)row[ix];
             }
         }
     }
-    return acc;
+    return bias + snn_simd_dot_i8(patch, &conv1_weights[och * 27], 27);
 }
 
 void snn_engine_infer(const uint8_t* image_chw, SNNInferenceResult* result) {
@@ -322,15 +329,24 @@ void snn_engine_infer_adaptive(
                 for (int ky = 0; ky < 3; ky++) {
                     int y = iy - ky + 1;
                     if (y < 0 || y >= 16) continue;
-                    for (int kx = 0; kx < 3; kx++) {
-                        int x = ix - kx + 1;
-                        if (x < 0 || x >= 16) continue;
-
-                        int out_offset = y * 16 + x;
+                    if (ix >= 1 && ix <= 14) {
+                        int out_base = y * 16 + (ix - 1);
                         for (int och = 0; och < CONV2_OUT_CHANNELS; och++) {
-                            int8_t w = conv2_weights[((och * 16 + ich) * 3 + ky) * 3 + kx];
-                            s_scratch_cur[och * (16 * 16) + out_offset] += w;
-                            active_sops++;
+                            const int8_t* w_row = &conv2_weights[((och * 16 + ich) * 3 + ky) * 3];
+                            snn_simd_acc_row3_rev_i8_to_i32(&s_scratch_cur[och * (16 * 16) + out_base], w_row);
+                        }
+                        active_sops += 3 * CONV2_OUT_CHANNELS;
+                    } else {
+                        for (int kx = 0; kx < 3; kx++) {
+                            int x = ix - kx + 1;
+                            if (x < 0 || x >= 16) continue;
+
+                            int out_offset = y * 16 + x;
+                            for (int och = 0; och < CONV2_OUT_CHANNELS; och++) {
+                                int8_t w = conv2_weights[((och * 16 + ich) * 3 + ky) * 3 + kx];
+                                s_scratch_cur[och * (16 * 16) + out_offset] += w;
+                                active_sops++;
+                            }
                         }
                     }
                 }
@@ -393,15 +409,24 @@ void snn_engine_infer_adaptive(
                 for (int ky = 0; ky < 3; ky++) {
                     int y = iy - ky + 1;
                     if (y < 0 || y >= 8) continue;
-                    for (int kx = 0; kx < 3; kx++) {
-                        int x = ix - kx + 1;
-                        if (x < 0 || x >= 8) continue;
-
-                        int out_offset = y * 8 + x;
+                    if (ix >= 1 && ix <= 6) {
+                        int out_base = y * 8 + (ix - 1);
                         for (int och = 0; och < CONV3_OUT_CHANNELS; och++) {
-                            int8_t w = conv3_weights[((och * 32 + ich) * 3 + ky) * 3 + kx];
-                            s_scratch_cur[och * (8 * 8) + out_offset] += w;
-                            active_sops++;
+                            const int8_t* w_row = &conv3_weights[((och * 32 + ich) * 3 + ky) * 3];
+                            snn_simd_acc_row3_rev_i8_to_i32(&s_scratch_cur[och * (8 * 8) + out_base], w_row);
+                        }
+                        active_sops += 3 * CONV3_OUT_CHANNELS;
+                    } else {
+                        for (int kx = 0; kx < 3; kx++) {
+                            int x = ix - kx + 1;
+                            if (x < 0 || x >= 8) continue;
+
+                            int out_offset = y * 8 + x;
+                            for (int och = 0; och < CONV3_OUT_CHANNELS; och++) {
+                                int8_t w = conv3_weights[((och * 32 + ich) * 3 + ky) * 3 + kx];
+                                s_scratch_cur[och * (8 * 8) + out_offset] += w;
+                                active_sops++;
+                            }
                         }
                     }
                 }
@@ -455,9 +480,11 @@ void snn_engine_infer_adaptive(
                 mask &= (mask - 1);
                 int idx = (word_idx << 5) + bit;
 
+                int8_t w_vec[FC_OUT_FEATURES];
                 for (int c = 0; c < FC_OUT_FEATURES; ++c) {
-                    cur4[c] += (int32_t)fc_weights[c * FC_IN_FEATURES + idx];
+                    w_vec[c] = fc_weights[c * FC_IN_FEATURES + idx];
                 }
+                snn_simd_acc_vec_i8_to_i32(cur4, w_vec, FC_OUT_FEATURES);
                 active_sops += FC_OUT_FEATURES;
             }
         }

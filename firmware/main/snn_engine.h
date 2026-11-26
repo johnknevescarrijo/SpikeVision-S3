@@ -91,6 +91,11 @@ size_t snn_engine_get_sram_bytes(void);
  */
 size_t snn_engine_get_sram_usage(void);
 
+/**
+ * Retorna o nome do backend SIMD utilizado pelo motor ("ESP-DSP", "Xtensa-LX7-PIE" ou "Scalar-C++17").
+ */
+const char* snn_engine_get_simd_backend(void);
+
 #ifdef __cplusplus
 }
 #endif

@@ -1,10 +1,10 @@
 # SpikeVision-S3 Firmware Makefile (Host Test & ESP-IDF Helper)
 
 CXX ?= g++
-CXXFLAGS = -O3 -Wall -Wextra -std=c++17 -Iinclude -Itest_samples -Imain
+CXXFLAGS = -O3 -Wall -Wextra -pthread -std=c++17 -Iinclude -Itest_samples -Imain
 HOST_BIN = build_host/spikevision_s3_host
 
-SRCS = main/main.cpp main/snn_engine.cpp
+SRCS = main/main.cpp main/snn_engine.cpp main/snn_pipeline.cpp
 
 .PHONY: all test host clean idf idf-build idf-flash idf-monitor
 

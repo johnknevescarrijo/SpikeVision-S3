@@ -11,5 +11,8 @@ CONFIG_COMPILER_OPTIMIZATION_PERF=y
 # Tamanho da Stack da Main Task (16 KB)
 CONFIG_ESP_MAIN_TASK_STACK_SIZE=16384
 
+# FreeRTOS Dual-Core (Core 0 I/O + Core 1 SNN) e Tick de 1 kHz (1 ms)
+CONFIG_FREERTOS_HZ=1000
+
 # Desabilita Watchdog em loops intensivos de inferência se necessário
 CONFIG_ESP_TASK_WDT_TIMEOUT_S=10
